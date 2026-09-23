@@ -39,7 +39,7 @@ The upstream C sources in `liblmdb/` are a reference for comparison. This design
 ## Current State
 
 - The design was discussed and agreed in conversation (2026-09-23). It is recorded here.
-- No Odin code exists yet. The repository contains only the `liblmdb/` reference sources.
+- KV-I-0001 (build steps 1–3) is implemented in the `kv` package (2026-09-24): the file format, open with meta-page selection, read and write transactions with copy-on-write, overflow values, commit, and cursors. It has 79 tests on macOS and Linux and is awaiting review. Delete, page reuse, the memory budget and crash testing remain.
 - Toolchain: Odin `dev-2026-09`. The development platform is macOS (Darwin). Linux is also a target.
 
 ## Future State

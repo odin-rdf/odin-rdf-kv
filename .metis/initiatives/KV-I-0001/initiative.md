@@ -209,3 +209,45 @@ Planned tasks, created at decompose time:
 9. **Model-check and snapshot-isolation tests,** and zero-allocation verification.
 
 **Exit criteria:** all requirements REQ-001 to REQ-009 and NFR-001 to NFR-005 are met, and every test above passes on macOS and Linux.
+
+## Results (2026-09-24)
+
+All nine tasks (KV-T-0001 to KV-T-0009) are complete. The suite of 79 tests passes on macOS arm64 (debug, speed, ASan; TSan for the threaded test) and on Linux arm64 and amd64 (debug, speed). Each task's status section records its detailed decisions and deviations.
+
+### Exit criteria
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| REQ-001 open or create, validation | ✓ | `env_test.odin` (create/reopen, bad magic, not a database, truncated) |
+| REQ-002 newest valid meta page wins | ✓ | `env_test.odin` (highest txn, fallback both ways, page-size probing), `commit_test.odin` (fallback after commits) |
+| REQ-003 zero-copy `get` | ✓ | `read_test.odin`, `alloc_test.odin` (slices in the map), `write_test.odin` (dirty pages) |
+| REQ-004 `put`, `Key_Too_Large`, `Txn_Read_Only` | ✓ | `write_test.odin` |
+| REQ-005 overflow values, one slice | ✓ | `overflow_test.odin`, `commit_test.odin` (after reopen) |
+| REQ-006 atomic durable commit; abort | ✓ | `commit_test.odin`, `model_test.odin` (346 commits, 63 aborts) |
+| REQ-007 snapshot isolation | ✓ | `commit_test.odin`, `isolation_test.odin` (4 threads, 100 commits) |
+| REQ-008 cursors in both transaction types | ✓ | `cursor_test.odin`, `model_test.odin` |
+| REQ-009 file growth, `Map_Full`, abortable | ✓ | `commit_test.odin`, `write_test.odin`, `model_test.odin` (until the map is full) |
+| NFR-001 reads allocate nothing | ✓ | `alloc_test.odin`, `read_test.odin`, `cursor_test.odin` |
+| NFR-002 value-type cursor, fixed stack | ✓ | `Cursor` holds a `Path` with `[MAX_DEPTH]Path_Entry`; covered by the zero-allocation tests |
+| NFR-003 single page access path | ✓ | `page_ptr` (overflow runs use the validated `overflow_value`) |
+| NFR-004 `F_FULLFSYNC` / `fdatasync` | ✓ | `os_darwin.odin`, `os_linux.odin` |
+| NFR-005 little-endian format | ✓ | `u16le`, `u32le`, `u64le` structs with `#assert`ed layout |
+
+### Deviations from this design, for review
+- **Page header:** the 2 reserved bytes come before `lower`/`upper`, so `overflow_count` is 4-byte aligned (KV-T-0001).
+- **`max_key`:** 1002 bytes at 4 KiB. The overhead is 16 bytes (an overflow leaf node), not the branch node's 10 (KV-T-0003).
+- **New errors:** `Locked`, `Invalid_Argument`, `Out_Of_Memory` (KV-T-0001, KV-T-0002, KV-T-0005).
+- **Map size:** `map_size` defaults to 1 GiB, and is enlarged at open to cover an existing file (KV-T-0002).
+- **Split protocol:** `split_point` works on the virtual sequence with the new node included. Rebuilding a page uses a 32 KiB stack scratch buffer (KV-T-0003).
+- **Write state:** stored on the heap (`Txn.write`), because `Txn` is returned by value. `put` checks `Map_Full` up front, and failures part-way through poison the transaction (KV-T-0005).
+- **Loose pages:** replaced overflow runs that this transaction wrote are dropped from the dirty map and recorded as `loose` (KV-T-0006).
+- **Cursor:** it has an explicit `Cursor_State` (LMDB-style edge behaviour) and a public `cursor_stale`. `Path_Entry.idx` is an `int` (KV-T-0004, KV-T-0008).
+- **Commit** always ends the transaction. A failed final sync leaves the on-disk outcome undetermined, as in LMDB (KV-T-0007).
+- **Caller restrictions:** `put` must not be given slices into the same transaction's dirty pages. `get` and cursor slices from a write transaction are invalidated by the next `put`.
+
+### Known limitations, planned for later steps
+- **No page reuse** (step 5): the file grows with every commit, and `freed`/`loose` are recorded but not yet used.
+- **No delete** (step 4).
+- **No memory budget, spilling or eviction** (step 6). Dirty pages and large values are held in the arena until commit.
+- **No crash testing** (kill during commit) or long fuzzing runs (step 7).
+- **Initialising a new file isn't crash-safe:** a crash during initialisation leaves a file that opens as `Corrupted`, and the parent directory isn't synced after creation.
