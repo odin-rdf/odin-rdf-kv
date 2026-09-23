@@ -28,6 +28,8 @@ Error :: enum u8 {
 	Locked,
 	// An option or argument is out of range, such as an invalid page size.
 	Invalid_Argument,
+	// Memory for a write transaction's dirty pages couldn't be allocated.
+	Out_Of_Memory,
 }
 
 // "ODKV" when read as bytes from the start of the meta struct.

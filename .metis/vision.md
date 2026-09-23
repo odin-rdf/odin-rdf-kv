@@ -136,7 +136,7 @@ A tested, crash-safe Odin library that:
   | Data | `get`, `put`, `del` |
   | Cursors | `cursor_open` (returns a value), `cursor_first`, `cursor_last`, `cursor_seek`, `cursor_next`, `cursor_prev` |
 
-- **Errors:** an `Error` enum (`None`, `Not_Found`, `Map_Full`, `Key_Too_Large`, `Corrupted`, `Io`, `Txn_Read_Only`, `Locked`, `Invalid_Argument`) returned as multiple return values, which works with `or_return`.
+- **Errors:** an `Error` enum (`None`, `Not_Found`, `Map_Full`, `Key_Too_Large`, `Corrupted`, `Io`, `Txn_Read_Only`, `Locked`, `Invalid_Argument`, `Out_Of_Memory`) returned as multiple return values, which works with `or_return`.
 - **Statistics:** `env_stats` reports the resident estimate, dirty pages, spills, evictions and fault rate, so the host can see the store's share of memory.
 
 ## Planned Build Order

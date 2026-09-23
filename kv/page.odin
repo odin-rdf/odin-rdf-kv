@@ -101,6 +101,9 @@ max_node_size :: proc "contextless" (page_size: int) -> int {
 @(private = "file")
 MAX_NODE_OVERHEAD :: max(size_of(Branch_Node_Header), size_of(Leaf_Node_Header) + size_of(u64le))
 
+// Longest key allowed for any page size, for sizing key buffers.
+MAX_KEY_SIZE_ANY :: ((MAX_PAGE_SIZE - PAGE_HEADER_SIZE) / 4 - SLOT_SIZE - MAX_NODE_OVERHEAD) &~ 1
+
 // Longest key allowed, rounded down to an even number: 1002 bytes for 4 KiB
 // pages.
 max_key_size :: proc "contextless" (page_size: int) -> int {
