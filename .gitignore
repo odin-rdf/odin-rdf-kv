@@ -1,0 +1,4 @@
+# Upstream LMDB C sources, kept locally for reference only
+liblmdb/
+
+.DS_Store
