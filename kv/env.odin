@@ -36,6 +36,8 @@ Env :: struct {
 	map_base:       [^]byte,
 	map_size:       int,
 	page_size:      int,
+	// Current size of the file in bytes. Only changed by the writer.
+	file_size:      i64,
 	// The last committed state. Guarded by snapshot_mutex.
 	snapshot:       Snapshot,
 	snapshot_mutex: sync.Mutex,
@@ -86,6 +88,7 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 		map_base  = base,
 		map_size  = map_size,
 		page_size = meta_page_size,
+		file_size = file_size,
 		snapshot  = snapshot_from_meta(meta),
 		allocator = allocator,
 	}
