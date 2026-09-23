@@ -26,6 +26,8 @@ Error :: enum u8 {
 	Txn_Read_Only,
 	// Another handle (in this or another process) holds the database lock.
 	Locked,
+	// An option or argument is out of range, such as an invalid page size.
+	Invalid_Argument,
 }
 
 // "ODKV" when read as bytes from the start of the meta struct.
