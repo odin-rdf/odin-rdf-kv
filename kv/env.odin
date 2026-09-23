@@ -41,7 +41,8 @@ Env :: struct {
 	snapshot_mutex: sync.Mutex,
 	// Held for the whole lifetime of a write transaction.
 	writer_mutex:   sync.Mutex,
-	// Number of transactions not yet ended. Checked by env_close in debug builds.
+	// Number of transactions not yet ended, updated atomically. Checked by
+	// env_close in debug builds.
 	active_txns:    int,
 	allocator:      runtime.Allocator,
 }
@@ -95,7 +96,7 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 // transactions must have ended.
 env_close :: proc(env: ^Env) {
 	when ODIN_DEBUG {
-		assert(env.active_txns == 0, "env_close with active transactions")
+		assert(sync.atomic_load(&env.active_txns) == 0, "env_close with active transactions")
 	}
 	os_unmap(env.map_base, env.map_size)
 	os_close(env.fd)
