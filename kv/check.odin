@@ -66,6 +66,26 @@ key_in_range :: proc(key: []byte, r: Key_Range) -> bool {
 	return true
 }
 
+// Checks an overflow run and marks all its pages as visited.
+@(private = "file")
+check_overflow :: proc(c: ^Tree_Checker, pgno: Pgno, key_len, val_len: int) -> (ok: bool, reason: string) {
+	count, err := overflow_check(c.txn, pgno, val_len)
+	if err != .None {
+		return false, "bad overflow run"
+	}
+	if !leaf_needs_overflow(c.txn.env.page_size, key_len, val_len) {
+		return false, "overflow run for a value that fits inline"
+	}
+	for i in 0 ..< count {
+		p := pgno + Pgno(i)
+		if p in c.visited {
+			return false, "overflow page reachable more than once"
+		}
+		c.visited[p] = {}
+	}
+	return true, ""
+}
+
 @(private = "file")
 check_subtree :: proc(c: ^Tree_Checker, pgno: Pgno, level: int, r: Key_Range) -> (ok: bool, reason: string) {
 	if pgno < 2 || pgno > c.txn.snapshot.last_pgno {
@@ -96,6 +116,11 @@ check_subtree :: proc(c: ^Tree_Checker, pgno: Pgno, level: int, r: Key_Range) ->
 		for i in 0 ..< n {
 			if !key_in_range(node_key(page, i), r) {
 				return false, "leaf key outside its parent's separators"
+			}
+			if _, overflow, bigdata := leaf_value(page, i); bigdata {
+				if run_ok, run_reason := check_overflow(c, overflow, len(node_key(page, i)), leaf_value_size(page, i)); !run_ok {
+					return false, run_reason
+				}
 			}
 		}
 		c.entries += u64(n)

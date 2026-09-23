@@ -47,6 +47,10 @@ Write_State :: struct {
 	// Pages of the snapshot that this transaction replaced. Page reuse
 	// (step 5) will put them on the free list at commit.
 	freed: [dynamic]Pgno,
+	// Pages this transaction allocated and then dropped again (a replaced
+	// overflow run). No reader ever saw them, so step 5 can reuse them
+	// immediately.
+	loose: [dynamic]Pgno,
 }
 
 // Begins a transaction. Read-only transactions never block and are never
@@ -62,6 +66,7 @@ txn_begin :: proc(env: ^Env, read_only := true) -> (txn: Txn, err: Error) {
 		arena := virtual.arena_allocator(&w.arena)
 		w.dirty = make(map[Pgno][]byte, arena)
 		w.freed = make([dynamic]Pgno, arena)
+		w.loose = make([dynamic]Pgno, arena)
 		txn.write = w
 	}
 

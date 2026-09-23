@@ -123,6 +123,12 @@ branch_node_size :: proc "contextless" (key_len: int) -> int {
 	return size_of(Branch_Node_Header) + key_len
 }
 
+// Number of pages in the overflow run holding a value of `val_len` bytes:
+// the page header, then the value, across contiguous pages.
+overflow_pages :: proc "contextless" (page_size, val_len: int) -> int {
+	return (PAGE_HEADER_SIZE + val_len + page_size - 1) / page_size
+}
+
 // Whether a key/value pair must store its value in overflow pages.
 leaf_needs_overflow :: proc "contextless" (page_size, key_len, val_len: int) -> bool {
 	return leaf_node_size(key_len, val_len, false) > overflow_threshold(page_size)

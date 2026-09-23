@@ -237,10 +237,6 @@ test_put_errors :: proc(t: ^testing.T) {
 	testing.expect_value(t, kv.put(&txn, too_long, nil), kv.Error.Key_Too_Large)
 	testing.expect_value(t, kv.put(&txn, too_long[:len(too_long) - 1], nil), kv.Error.None)
 
-	// Values that need overflow pages are rejected until KV-T-0006.
-	huge := make([]byte, kv.overflow_threshold(env.page_size), context.temp_allocator)
-	testing.expect_value(t, kv.put(&txn, transmute([]byte)string("k"), huge), kv.Error.Invalid_Argument)
-
 	// Argument errors don't poison the transaction.
 	testing.expect_value(t, txn.err, kv.Error.None)
 	testing.expect_value(t, kv.put(&txn, transmute([]byte)string("k"), transmute([]byte)string("v")), kv.Error.None)

@@ -95,10 +95,10 @@ get :: proc(txn: ^Txn, key: []byte) -> (value: []byte, err: Error) {
 		return nil, .Not_Found
 	}
 	leaf := path_leaf(&path)
-	data, _, bigdata := leaf_value(page_ptr(txn, leaf.pgno), leaf.idx)
+	page := page_ptr(txn, leaf.pgno)
+	data, overflow, bigdata := leaf_value(page, leaf.idx)
 	if bigdata {
-		// Overflow values arrive with KV-T-0006.
-		return nil, .Corrupted
+		return overflow_value(txn, overflow, leaf_value_size(page, leaf.idx))
 	}
 	return data, .None
 }

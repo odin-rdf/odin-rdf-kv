@@ -79,14 +79,17 @@ put :: proc(txn: ^Txn, key, value: []byte) -> Error {
 	if len(key) > max_key_size(ps) {
 		return .Key_Too_Large
 	}
-	if len(value) > int(max(u32)) || leaf_needs_overflow(ps, len(key), len(value)) {
-		// Overflow values arrive with KV-T-0006.
+	if len(value) > int(max(u32)) {
 		return .Invalid_Argument
 	}
-	// Worst case: copy every page on the path, split every level, and add a
-	// new root. Checking up front means a full map never leaves a half-done
-	// change behind.
-	if !pages_available(txn, 2 * int(txn.snapshot.depth) + 1) {
+	// Worst case: an overflow run for the value, then copy every page on the
+	// path, split every level, and add a new root. Checking up front means a
+	// full map never leaves a half-done change behind.
+	needed := 2 * int(txn.snapshot.depth) + 1
+	if leaf_needs_overflow(ps, len(key), len(value)) {
+		needed += overflow_pages(ps, len(value))
+	}
+	if !pages_available(txn, needed) {
 		return .Map_Full
 	}
 
@@ -101,57 +104,77 @@ put :: proc(txn: ^Txn, key, value: []byte) -> Error {
 put_unchecked :: proc(txn: ^Txn, key, value: []byte) -> Error {
 	snap := &txn.snapshot
 	txn.mods += 1
-
-	if snap.root == 0 {
-		pgno, leaf := page_alloc(txn, 1) or_return
-		page_init(leaf, pgno, PAGE_LEAF)
-		ok := leaf_insert(leaf, 0, key, value)
-		assert(ok)
-		snap.root, snap.depth, snap.entries = pgno, 1, 1
-		return .None
-	}
+	bigdata := leaf_needs_overflow(txn.env.page_size, len(key), len(value))
 
 	path: Path
-	exact := tree_search(txn, key, &path) or_return
-	for level in 0 ..< path.depth {
-		page_touch(txn, &path, level) or_return
+	exact := false
+	if snap.root != 0 {
+		exact = tree_search(txn, key, &path) or_return
+		for level in 0 ..< path.depth {
+			page_touch(txn, &path, level) or_return
+		}
 	}
-	e := path_leaf(&path)
-	leaf := page_ptr(txn, e.pgno)
 
 	if exact {
-		old, _, bigdata := leaf_value(leaf, e.idx)
-		if !bigdata && len(old) == len(value) {
+		e := path_leaf(&path)
+		leaf := page_ptr(txn, e.pgno)
+		old, old_overflow, old_bigdata := leaf_value(leaf, e.idx)
+		if !old_bigdata && !bigdata && len(old) == len(value) {
 			copy(old, value)
 			return .None
+		}
+		if old_bigdata {
+			overflow_free(txn, old_overflow, leaf_value_size(leaf, e.idx)) or_return
 		}
 		node_remove(leaf, e.idx)
 	} else {
 		snap.entries += 1
 	}
-	return insert_node(txn, &path, path.depth - 1, Pending_Node{key = key, value = value})
+
+	node := Pending_Node{key = key, value = value}
+	if bigdata {
+		node.overflow = overflow_write(txn, value) or_return
+	}
+
+	if snap.root == 0 {
+		pgno, leaf := page_alloc(txn, 1) or_return
+		page_init(leaf, pgno, PAGE_LEAF)
+		ok := pending_insert(leaf, 0, node, true)
+		assert(ok)
+		snap.root, snap.depth = pgno, 1
+		return .None
+	}
+	return insert_node(txn, &path, path.depth - 1, node)
 }
 
-// A node waiting to be inserted: a leaf node (key and value) or a branch
-// node (key and child).
+// A node waiting to be inserted: a leaf node (key, and the value inline or
+// in the overflow run starting at `overflow`) or a branch node (key and
+// child).
 @(private = "file")
 Pending_Node :: struct {
-	key:   []byte,
-	value: []byte,
-	child: Pgno,
+	key:      []byte,
+	value:    []byte,
+	overflow: Pgno,
+	child:    Pgno,
 }
 
 @(private = "file")
 pending_size :: proc(node: Pending_Node, leaf: bool) -> int {
-	return leaf_node_size(len(node.key), len(node.value), false) if leaf else branch_node_size(len(node.key))
+	if !leaf {
+		return branch_node_size(len(node.key))
+	}
+	return leaf_node_size(len(node.key), len(node.value), node.overflow != 0)
 }
 
 @(private = "file")
 pending_insert :: proc(page: []byte, idx: int, node: Pending_Node, leaf: bool) -> bool {
-	if leaf {
-		return leaf_insert(page, idx, node.key, node.value)
+	if !leaf {
+		return branch_insert(page, idx, node.key, node.child)
 	}
-	return branch_insert(page, idx, node.key, node.child)
+	if node.overflow != 0 {
+		return leaf_insert_overflow(page, idx, node.key, node.overflow, len(node.value))
+	}
+	return leaf_insert(page, idx, node.key, node.value)
 }
 
 /*
