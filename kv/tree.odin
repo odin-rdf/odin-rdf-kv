@@ -70,7 +70,7 @@ tree_search :: proc(txn: ^Txn, key: []byte, path: ^Path) -> (exact: bool, err: E
 // Cheap sanity checks on a page reached by following a pointer: the page
 // number it records, its kind, and header fields that other accessors
 // slice with.
-@(private = "file")
+@(private)
 page_check_header :: proc(page: []byte, pgno: Pgno, leaf: bool) -> Error {
 	h := page_header(page)
 	if Pgno(h.pgno) != pgno || u16(h.flags) != (PAGE_LEAF if leaf else PAGE_BRANCH) {
