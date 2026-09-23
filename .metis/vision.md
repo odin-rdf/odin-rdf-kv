@@ -1,7 +1,7 @@
 ---
-id: odin-lmdb
+id: odin-rdf-kv
 level: vision
-title: "odin-lmdb"
+title: "odin-rdf-kv"
 short_code: "KV-V-0001"
 created_at: 2026-09-23T22:01:04.716865+00:00
 updated_at: 2026-09-23T22:03:30.654937+00:00
@@ -16,7 +16,7 @@ exit_criteria_met: false
 initiative_id: NULL
 ---
 
-# odin-lmdb Vision
+# odin-rdf-kv Vision
 
 ## Purpose
 
