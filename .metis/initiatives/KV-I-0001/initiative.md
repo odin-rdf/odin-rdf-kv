@@ -116,8 +116,9 @@ The code is one Odin package, `kv`, split by concern:
 - **Leaf node:** `key_len: u16le`, `flags: u16le` (`BIGDATA`), `val_len: u32le`, the key bytes, then the value bytes, or a `u64le` overflow page number when `BIGDATA` is set.
 - **Branch node:** `child: u64le`, `key_len: u16le`, the key bytes. The key in slot 0 is ignored and treated as −∞, so it is stored with length 0.
 - **Limits:**
-  - `max_key = (page_size − header) / 4 − slot_size − branch_node_overhead`, rounded down to an even number.
-  - Overflow threshold: a value goes to overflow pages when the whole leaf node would exceed `(page_size − header) / 4`.
+  - `max_node_size = (page_size − header) / 4 − slot_size`: the largest node, excluding its slot. Every node plus its slot takes at most a quarter of the usable space, so every page holds at least 4 nodes.
+  - `max_key = max_node_size − 16`, rounded down to an even number: 1002 bytes at 4 KiB pages. The 16 bytes are the largest node overhead: a leaf node whose value is in overflow pages (8-byte header plus 8-byte page number). A branch node's overhead is only 10.
+  - **Overflow threshold:** a value goes to overflow pages when the inline leaf node would exceed `max_node_size` (`leaf_needs_overflow`).
 
 ### Byte order and alignment
 - **Byte order:** every target the Odin compiler supports is little-endian, so the `le` field types cost nothing. They document the format and keep files portable between machines.

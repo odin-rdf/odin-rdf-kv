@@ -61,7 +61,7 @@ A tested, crash-safe Odin library that:
 - **Leaf nodes:** `key_len: u16`, `flags: u16`, `val_len: u32`, the key, then the value inline or an overflow page number (`BIGDATA` flag).
 - **Branch nodes:** `child_pgno: u64`, `key_len: u16`, the key. The key in slot 0 is treated as −∞.
 - **Overflow pages:** values larger than about `page_size / 4` are stored in a *contiguous* run of overflow pages, so a zero-copy slice covers the whole value.
-- **Maximum key size:** capped so that a branch page always holds at least 4 keys (about 500 bytes at 4 KiB pages).
+- **Maximum key size:** capped so that every page (branch or leaf) always holds at least 4 nodes: 1002 bytes at 4 KiB pages.
 - **Odin conventions:** on-disk fields use `u16le`, `u32le` and `u64le`. `Pgno` and `Txn_Id` are `distinct u64`.
 
 ### Memory map and I/O
