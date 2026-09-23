@@ -4,14 +4,14 @@ level: initiative
 title: "Core copy-on-write B+tree: file format, write path and cursors"
 short_code: "KV-I-0001"
 created_at: 2026-09-23T22:03:32.986460+00:00
-updated_at: 2026-09-23T22:06:51.207606+00:00
+updated_at: 2026-09-23T22:18:37.403285+00:00
 parent: KV-V-0001
 blocked_by: []
 archived: false
 
 tags:
   - "#initiative"
-  - "#phase/decompose"
+  - "#phase/active"
 
 
 exit_criteria_met: false
@@ -112,12 +112,32 @@ The code is one Odin package, `kv`, split by concern:
   - `freelist_pgno: u64le` and `freelist_count: u64le`, reserved for step 5 and written as 0;
   - `checksum: u64le` over the preceding bytes.
   - Checksum algorithm: xxHash64 via `xxhash.XXH64` from `core:hash/xxhash`, with the default seed.
-- **Page header:** `pgno: u64le`, `flags: u16le` (`BRANCH`, `LEAF`, `OVERFLOW`, `META`), `lower: u16le`, `upper: u16le`, and 2 bytes of padding. For overflow pages, `lower` and `upper` are replaced by `overflow_count: u32le`.
+- **Page header (16 bytes):** `pgno: u64le`, `flags: u16le` (`BRANCH`, `LEAF`, `OVERFLOW`, `META`), 2 reserved bytes, then `lower: u16le` and `upper: u16le`. For overflow pages, `lower` and `upper` are replaced by `overflow_count: u32le`; placing them at offset 12 keeps that union 4-byte-aligned.
 - **Leaf node:** `key_len: u16le`, `flags: u16le` (`BIGDATA`), `val_len: u32le`, the key bytes, then the value bytes, or a `u64le` overflow page number when `BIGDATA` is set.
 - **Branch node:** `child: u64le`, `key_len: u16le`, the key bytes. The key in slot 0 is ignored and treated as −∞, so it is stored with length 0.
 - **Limits:**
   - `max_key = (page_size − header) / 4 − slot_size − branch_node_overhead`, rounded down to an even number.
   - Overflow threshold: a value goes to overflow pages when the whole leaf node would exceed `(page_size − header) / 4`.
+
+### Byte order and alignment
+- **Byte order:** every target the Odin compiler supports is little-endian, so the `le` field types cost nothing. They document the format and keep files portable between machines.
+- **Integer keys must be stored big-endian.** Keys sort by `memcmp`, so only big-endian encoding sorts numerically. This matters for RDF index keys built from `u64` term IDs. Read them back with unaligned big-endian loads (`core:encoding/endian`, or a `#packed` struct of `u64be` fields).
+- **64-bit targets only,** enforced by `#assert(size_of(int) == 8)` in `types.odin`.
+- **Alignment guarantees:**
+
+  | Data | Alignment |
+  |---|---|
+  | Page header | Page-aligned in the map |
+  | `Meta` | 8 bytes (offset 16) |
+  | Slots | 2 bytes |
+  | Overflow values | 16 bytes (offset 16 of a page-aligned run) |
+  | Node headers, the `BIGDATA` page number, inline keys and values | None: any byte offset |
+
+- **Inline values are deliberately not padded** (decided 2026-09-24). Callers must not cast a value slice to a pointer to a multi-byte type; they read fields with unaligned loads or copy them out. This matches LMDB, and avoids up to 7 bytes of padding per entry.
+- **Rules for the code:**
+  - Node headers are `#packed` structs, and their fields are only read and written by value. Never take the address of a packed field.
+  - The `BIGDATA` page number is read through a `#packed` struct or `intrinsics.unaligned_load`, never by casting to `^u64le`.
+  - Page buffers outside the map (dirty pages, test buffers) must be allocated with at least `align_of(Page_Header)` alignment; dirty pages use page-size alignment. In debug builds, `page_header` and `page_meta` assert this.
 
 ### Page handling
 - **`page_ptr(txn, pgno)`:** in a write transaction, check the dirty map first; otherwise return `map_base + pgno * page_size`. This is the only access path (NFR-003).

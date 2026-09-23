@@ -122,6 +122,8 @@ A tested, crash-safe Odin library that:
 - A slice from a read transaction is valid until that transaction ends.
 - A slice from inside a write transaction is invalidated by the next `put` or `del`, or by commit or abort.
 - Debug builds check transaction and cursor generation counters and support running under ASan.
+- **Inline values have no alignment guarantee.** Callers read fields with unaligned loads rather than casting slices to struct pointers. Overflow values are 16-byte aligned.
+- **Integer keys must be encoded big-endian** to sort numerically under `memcmp` ordering.
 
 ## Major Features
 
@@ -171,6 +173,7 @@ A tested, crash-safe Odin library that:
 - Single process only. Multi-process access is out of scope for now.
 - No named sub-databases, duplicate keys, nested transactions or prefix compression in the first version.
 - Only one writer at a time.
+- 64-bit targets only.
 - The memory budget for mapped pages is approximate (soft), and the address-space reservation (`map_size`) is fixed at open.
 - Long-lived read transactions prevent page reuse and make the file grow.
 - The host process's memory cannot be limited; the store can only limit its own.
