@@ -156,3 +156,41 @@ The tasks were created at decompose time (2026-09-24), with one commit per task:
 3. **KV-T-0018, verification:** `del` in the randomized model and in the threaded isolation test (TSan), the reader test, the churn steady state, delete-everything, the fill measurement, the Linux runs; update the vision's Current State, `CLAUDE.md` and this document's Results.
 
 **Exit criteria:** REQ-001 to REQ-008 and NFR-001 to NFR-004 are met, `space_check` passes after every commit in every test that commits, the deliberate-bug checks each fail a test, and the full matrix passes on macOS and Linux.
+
+## Results (2026-09-24)
+
+All three tasks (KV-T-0016 to KV-T-0018) are complete. The ordinary suite has 132 tests and passes on macOS arm64 (debug, speed, ASan; the threaded tests under TSan) and on Linux arm64 and amd64 (debug, speed). `scripts/test.sh --steady` (136 tests, the four steady-state tests included) passes in all three macOS configurations, 3½–4 minutes each. Each task's status section records its decisions, measurements and deliberate-bug checks.
+
+### Exit criteria
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| REQ-001 a missing key changes nothing | ✓ | `test_del_not_found_changes_nothing` (no dirty page, `mods` unchanged, cursor still valid); the model's absent deletes (about 4,000 a run) |
+| REQ-002 read-only, earlier errors, failure after changes | ✓ | `test_del_read_only`; `del` mirrors `put` (`txn.err` set by `del_unchecked`) |
+| REQ-003 overflow run freed, loose or freed | ✓ | `test_del_overflow_value`; `space_check` after every commit with overflow deletes in the model |
+| REQ-004 no empty page below the root; underfull pages merge when they fit | ✓ | the ten shape tests in `delete_test.odin`; `tree_check` rejects an empty page below the root and runs after every commit everywhere |
+| REQ-005 root collapse, empty tree, entry count | ✓ | `test_del_collapses_several_levels`, `branch_merge_left_collapses_root`, `drops_empty_leaf_under_single_child_parent`, `last_key`; the model empties the tree 6–8 times a run |
+| REQ-006 `Map_Full` up front | ✓, scoped | `test_del_map_full`: with no page left `del` returns `Map_Full` and changes nothing. At a full map with reusable pages, deletes succeed until those run out (each copies its path, and the pages it frees wait for later commits), then return `Map_Full` with the transaction usable |
+| REQ-007 a key from the transaction's own pages | ✓ | `test_del_key_from_same_txn` (a value from `get`, the range and delete-everything patterns from `del`'s comment) |
+| REQ-008 cursors and slices invalidated | ✓ | `test_del_not_found_changes_nothing` (stale after a real delete) |
+| NFR-001 no heap allocation beyond pages and page lists | ✓ | `del` and the merge primitives use the path, a stack scratch page and `page_alloc`/`page_free` only |
+| NFR-002 no format change | ✓ | no change to the page, meta or free-list layout |
+| NFR-003 readers unaffected | ✓ | `test_del_reader_keeps_snapshot`; the model's held readers (about 110 a run, over about 930 commits); the isolation test with a third of its operations deletes, under TSan |
+| NFR-004 bounded file under churn | ✓ | `steady_state_churn` at 10⁴ commits, three runs (one per configuration of `scripts/test.sh --steady`): loaded at 352 pages, 368–373 after 5,000 and the same after 10,000; the second half wrote about 27,500 pages and added none |
+
+### Fill after deletes (D1, measured)
+
+`test_bench_delete_fill` (under `KV_BENCH`), 50,000 keys of 8 bytes with 0–100-byte values: after deleting 50% at random the tree has about 1,050 leaves at 40% fill, where inserting the survivors gives 590 at 70%; after 90%, 181–193 leaves at 43–46% and depth 3, against 120 at 68% and depth 2. **No leaf fell below 25% and no branch below the root had a single child in either run**, so the case D1 allows for (an underfull page whose siblings are both too full to merge) didn't arise. Pages settle just above the merge threshold. Borrowing isn't needed on this evidence.
+
+### Deviations from the design
+- **The separator is read in place** (D6 said it would be copied to a stack buffer): `page_merge` only reads the parent, and the parent changes only after the merge.
+- **`txn_commit` counts changes, not dirty pages.** It skipped any transaction with no dirty pages as unchanged, and a delete that empties the tree leaves none (every page it copied goes to `loose`). Found by `test_del_last_key`: the last batch's commit was silently dropped.
+- **`del` doesn't set `txn.err` when its search fails** (`Corrupted`): nothing has changed yet.
+- **Test helpers:** `build_tree_shape` builds any shape; the tree builders' page buffers are 16-aligned (`page_buf_make`), which `build_tree_file` had only been lucky about.
+- **The model test** gained deletes and tides (rising 40% put / 10% del; falling the reverse until the tree is empty). `test_model_until_map_full` keeps a rising tide only and a 4 MiB map (was 5), because with deletes about 80% of keys stay present and 5 MiB never filled.
+
+### Known limitations
+- **Trees are less full after deletes** (above): about 1.6–1.8× the leaves of an insert-only tree, sometimes a level deeper. Space is reclaimed to the free list, not returned to the file.
+- **A delete at a full map** needs its path's worth of pages before it can free anything, as in LMDB.
+- **Merges only happen on the path a delete takes.** An underfull page whose siblings were too full is only reconsidered when a later delete passes through it, not when its siblings shrink.
+- **Still ahead:** the memory budget (step 6) and the kill-during-commit harness (step 7).

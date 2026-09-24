@@ -9,11 +9,12 @@ Metis (`.metis/`) is the system of record for plans, decisions and progress. Sta
 - `.metis/vision.md` (KV-V-0001): the design, the build order (steps 1–7) and the current state.
 - `.metis/archived/initiatives/KV-I-0001/initiative.md`: steps 1–3 (completed and archived). Its **Results** section lists the exit-criteria evidence, every deviation from the design, and the known limitations.
 - `.metis/archived/initiatives/KV-I-0002/initiative.md`: step 5, page reuse (completed and archived). Its **Results** section has the same, plus the steady-state and free-list cost measurements.
+- `.metis/initiatives/KV-I-0003/initiative.md`: step 4, delete with merge (completed). Its **Results** section has the exit-criteria evidence, the fill measurement after deletes, and the deviations.
 - Each task's **Status Updates** section records decisions made during implementation and the reasons for them.
 
 `metis list` shows everything. `metis.db` is gitignored runtime state; after a fresh clone, run `metis sync` to rebuild it from the markdown.
 
-**Next up:** step 4 (delete with merge) is KV-I-0003, active, in `.metis/initiatives/KV-I-0003/`: KV-T-0016 (page-level merge primitives), KV-T-0017 (`del`), KV-T-0018 (verification). Then step 6 (the memory budget). Delete frees pages through the same `freed` list, so page reuse needs no changes for it. `Stats` (`env_stats`) is where step 6's figures go. The two backlog items that came out of KV-I-0002 are done: KV-T-0014 (the free list's run may have one page of slack) and KV-T-0015 (a transaction remembers what its run searches proved).
+**Next up:** step 6 (the memory budget). Delete (step 4) is done: KV-I-0003, in `.metis/initiatives/KV-I-0003/` until it is archived. `Stats` (`env_stats`) is where step 6's figures go.
 
 ## Working agreement
 
@@ -40,8 +41,9 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 
 - **Linux tests:** these need Docker. On macOS that is OrbStack, which is normally stopped: run `orb start` first and `orb stop` afterwards. `scripts/linux.Dockerfile` pins the Odin release, so keep its `ODIN_VERSION` in step with `odin version` (currently dev-2026-09).
 - **ThreadSanitizer:** `-sanitize:thread` works on macOS arm64. Use it for `test_snapshot_isolation_across_threads` and `test_reader_table_across_threads`. A race only shows when the two accesses overlap, so run a threaded check more than once.
-- **Steady-state tests are on demand:** the plateau, full-map and long-reader tests make thousands of synced commits (the first two 10⁴ each; `F_FULLFSYNC` on macOS is about 4 ms), about 3 minutes per configuration, so they only run with `-define:KV_STEADY=true` or `scripts/test.sh --steady`. Run them after changing allocation, the free list or commit. While iterating, also pass `-define:KV_STEADY_COMMITS=1000`.
+- **Steady-state tests are on demand:** the plateau, full-map, long-reader and churn tests make thousands of synced commits (all but the long reader 10⁴ each; `F_FULLFSYNC` on macOS is about 4 ms), about 3½–4 minutes per configuration, so they only run with `-define:KV_STEADY=true` or `scripts/test.sh --steady`. Run them after changing allocation, the free list or commit. While iterating, also pass `-define:KV_STEADY_COMMITS=1000`.
 - **Free-list cost measurement:** `odin test tests -o:speed -define:KV_BENCH=true -define:ODIN_TEST_NAMES=kv_tests.test_bench_free_list_cost`.
+- **Fill after deletes:** `odin test tests -o:speed -define:KV_BENCH=true -define:ODIN_TEST_NAMES=kv_tests.test_bench_delete_fill` (reported, not asserted).
 - **Supported targets:** only 64-bit targets are supported (`#assert(size_of(int) == 8)`).
 
 ## Code map
@@ -70,7 +72,7 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 - `tests/freelist_test.odin`: `open_hand_list` opens a database with a hand-written free list.
 - `tests/steady_test.odin`: the steady-state workload (`steady_commit`) and `expect_latest_ok` (`space_check` and `tree_check` on a new reader).
 
-**Other test files:** `delete_test.odin` (delete shapes and semantics; `sized_entries`, `expect_shape_keys`, `commit_ok`), `reader_test.odin` (reader table), `reuse_test.odin` (reuse rules), `steady_test.odin` (`env_stats`; plateau, full map and long reader on demand), `isolation_test.odin` (threads, including readers that come and go while pages are reused), and `bench_test.odin` (the free-list cost measurement, only registered with `-define:KV_BENCH=true`).
+**Other test files:** `delete_test.odin` (delete shapes and semantics; `sized_entries`, `expect_shape_keys`, `commit_ok`), `reader_test.odin` (reader table), `reuse_test.odin` (reuse rules), `steady_test.odin` (`env_stats`; plateau, full map, long reader and insert/delete churn on demand), `isolation_test.odin` (threads, including readers that come and go while pages are reused), `bench_test.odin` and `fill_test.odin` (the free-list cost and the fill after deletes, only registered with `-define:KV_BENCH=true`).
 
 ## Invariants and conventions
 

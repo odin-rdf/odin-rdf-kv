@@ -148,7 +148,8 @@ churn_reader_run :: proc(r: ^Churn_Reader) {
 
 /*
 Readers see their snapshot however much the writer changes, while pages are
-reused under them. First four readers hold one snapshot for 100 commits,
+reused under them. A third of the writer's operations are deletes, so pages
+merge and are dropped under the readers too. First four readers hold one snapshot for 100 commits,
 which pins every page those commits free. Then four readers keep beginning
 and ending transactions for 200 more commits, so the horizon moves and
 freed pages are reused all the time; each checks its scans against the
@@ -176,8 +177,9 @@ test_snapshot_isolation_across_threads :: proc(t: ^testing.T) {
 
 	version: u32
 	// Puts `count` random keys (new or existing, some with overflow values)
-	// in one commit, updating the model.
-	commit_random :: proc(t: ^testing.T, env: ^kv.Env, ks: Key_Space, model: Model, buf: []byte, count: int, version: ^u32, ps: int) -> bool {
+	// in one commit, updating the model. With `deletes`, a third of the
+	// operations delete a random key instead, present or not.
+	commit_random :: proc(t: ^testing.T, env: ^kv.Env, ks: Key_Space, model: Model, buf: []byte, count: int, version: ^u32, ps: int, deletes := true) -> bool {
 		txn, err := kv.txn_begin(env, read_only = false)
 		if err != .None {
 			return false
@@ -185,6 +187,14 @@ test_snapshot_isolation_across_threads :: proc(t: ^testing.T) {
 		defer kv.txn_abort(&txn)
 		for _ in 0 ..< count {
 			id := rand.int_max(len(model))
+			if deletes && rand.int_max(3) == 0 {
+				want := kv.Error.None if model[id].present else kv.Error.Not_Found
+				if kv.del(&txn, ks.keys[id]) != want {
+					return false
+				}
+				model[id] = {}
+				continue
+			}
 			version^ += 1
 			size := rand.int_max(3 * ps) if rand.int_max(20) == 0 else rand.int_max(40)
 			spec := Val_Spec{true, version^, size}
@@ -197,7 +207,7 @@ test_snapshot_isolation_across_threads :: proc(t: ^testing.T) {
 	}
 
 	// The starting state: about 10,000 keys.
-	testing.expect(t, commit_random(t, env, ks, model, value_buf, 16_000, &version, ps), "initial commit failed")
+	testing.expect(t, commit_random(t, env, ks, model, value_buf, 16_000, &version, ps, deletes = false), "initial commit failed")
 	base_txn := kv.env_snapshot(env).txn_id
 	frozen := slice.clone(model, context.temp_allocator)
 
@@ -275,7 +285,7 @@ test_snapshot_isolation_across_threads :: proc(t: ^testing.T) {
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&r, churn_reader_run)
 	}
-	reused, overflow, seen := 0, 0, 0
+	reused, overflow, deleted, seen := 0, 0, 0, 0
 	for c in 0 ..< CHURN_COMMITS {
 		for sync.atomic_load(&finished) == seen && sync.atomic_load(&running) > 0 {
 			time.sleep(100 * time.Microsecond)
@@ -290,6 +300,19 @@ test_snapshot_isolation_across_threads :: proc(t: ^testing.T) {
 		failed := false
 		for _ in 0 ..< 50 {
 			id := rand.int_max(len(model))
+			if rand.int_max(3) == 0 {
+				want := kv.Error.None if model[id].present else kv.Error.Not_Found
+				if kv.del(&txn, ks.keys[id]) != want {
+					failed = true
+					break
+				}
+				if model[id].present {
+					sum -= entry_hash(ks.keys[id], model_value(id, model[id], value_buf))
+					deleted += 1
+				}
+				model[id] = {}
+				continue
+			}
 			version += 1
 			big := rand.int_max(20) == 0
 			spec := Val_Spec{true, version, rand.int_max(3 * ps) if big else rand.int_max(40)}
@@ -333,7 +356,7 @@ test_snapshot_isolation_across_threads :: proc(t: ^testing.T) {
 		testing.expectf(t, r.txns >= 1, "churn reader %d never finished a transaction", i)
 		total += r.txns
 	}
-	log.infof("%d read transactions across %d commits (%d overflow values) that reused %d pages; %v", total, CHURN_COMMITS, overflow, reused, kv.env_stats(env))
+	log.infof("%d read transactions across %d commits (%d overflow values, %d deletes) that reused %d pages; %v", total, CHURN_COMMITS, overflow, deleted, reused, kv.env_stats(env))
 	testing.expect(t, total >= CHURN_COMMITS, "too few read transactions")
 	testing.expect(t, reused > 10 * CHURN_COMMITS, "too few pages reused")
 	testing.expect_value(t, kv.env_stats(env).readers, 0)

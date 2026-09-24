@@ -9,6 +9,9 @@ import kv "../kv"
 
 Model_Stats :: struct {
 	puts, overflow_puts, gets, scans, commits, aborts, reopens: int,
+	// Deletes of present keys, deletes of absent ones (Not_Found), and
+	// commits that left the tree empty.
+	dels, absent_dels, empty_commits:                          int,
 	// Read transactions held across commits and checked on release, the
 	// commits they were held across in total, and pages that commits wrote
 	// in place of a page of the file they began from (reused pages).
@@ -36,11 +39,16 @@ every page is owned exactly once before and after every commit. Stops early (ret
 `stop_on_map_full` is set and a put hits Map_Full, after aborting, reopening
 and checking that the database is still at the last commit.
 
-The workload:
-- 45% put, a new key or an overwrite: 70% small values, 20% within a few
-  bytes of the inline/overflow boundary, 10% overflow values of up to 3
-  pages;
-- 30% get, of present and absent keys;
+The workload alternates between tides: a rising tide of 10–40 commits,
+then a falling one that lasts until a commit leaves the tree empty (or 200
+commits). Without `tides` the tide never falls. Each operation is:
+- 40% (rising) or 10% (falling) put, a new key or an overwrite: 70% small
+  values, 20% within a few bytes of the inline/overflow boundary, 10%
+  overflow values of up to 3 pages;
+- 10% (rising) or 40% (falling) delete: 80% of a present key (the first
+  present one from a random position in key order), 20% of a random id,
+  which may be absent;
+- 25% get, of present and absent keys;
 - 15% forward range scan: seek (to a key or random bytes), then up to 20
   nexts;
 - 10% backward walk: seek, then up to 10 prevs.
@@ -54,7 +62,7 @@ is released after 1–20 further commits (or before a reopen). On release it
 must still match the model it began at, by model_diff and space_check, so a
 page reused while a reader could still see it is caught.
 */
-run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, keys: int, stop_on_map_full := false, max_held := MODEL_HELD_READERS) -> (stats: Model_Stats, hit_map_full: bool) {
+run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, keys: int, stop_on_map_full := false, max_held := MODEL_HELD_READERS, tides := true) -> (stats: Model_Stats, hit_map_full: bool) {
 	seed := t.seed
 	ks := key_space_make(keys)
 	committed := make(Model, keys, context.temp_allocator)
@@ -85,6 +93,10 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 	txn_ops, txn_limit := 0, 0
 	last_reopen := 0
 	version: u32
+	// The tide: whether the tree is being emptied, and the commit at which
+	// a rising tide turns.
+	falling := false
+	tide_turn := 10 + rand.int_max(31)
 
 	for op in 0 ..< ops {
 		if !in_txn {
@@ -117,8 +129,9 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 		}
 
 		id := rand.int_max(keys)
+		put_pct := 10 if falling else 40
 		switch r := rand.int_max(100); {
-		case r < 45:
+		case r < put_pct:
 			key := ks.keys[id]
 			max_inline := threshold - kv.leaf_node_size(len(key), 0, false)
 			size: int
@@ -153,6 +166,41 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			}
 			working[id] = spec
 			stats.puts += 1
+
+		case r < 50:
+			if rand.int_max(5) != 0 {
+				// A present key, if there is one.
+				pos := next_present(ks, working, rand.int_max(keys), 1)
+				if pos == keys {
+					pos = next_present(ks, working, 0, 1)
+				}
+				if pos < keys {
+					id = ks.sorted_ids[pos]
+				}
+			}
+			del_err := kv.del(&txn, ks.keys[id])
+			if del_err == .Map_Full && txn.err != .None {
+				testing.expectf(t, false, "[seed %d] op %d: del hit Map_Full part-way", seed, op)
+				return
+			}
+			if del_err == .Map_Full && stop_on_map_full {
+				kv.txn_abort(&txn)
+				if !held_release(t, held[:], ks, value_buf, &stats, seed, all = true) {
+					return
+				}
+				return stats, map_full_reopen(t, &env, path, options, ks, committed, value_buf, seed)
+			}
+			want := kv.Error.None if working[id].present else kv.Error.Not_Found
+			if del_err != want {
+				testing.expectf(t, false, "[seed %d] op %d: del of id %d: %v, want %v", seed, op, id, del_err, want)
+				return
+			}
+			if want == .None {
+				working[id] = {}
+				stats.dels += 1
+			} else {
+				stats.absent_dels += 1
+			}
 
 		case r < 75:
 			got, get_err := kv.get(&txn, ks.keys[id])
@@ -226,6 +274,15 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			}
 			copy(committed, working)
 			stats.commits += 1
+			if model_count(committed) == 0 {
+				stats.empty_commits += 1
+			}
+			// Turn the tide: a falling one once the tree is empty.
+			if falling && (model_count(committed) == 0 || stats.commits >= tide_turn) {
+				falling, tide_turn = false, stats.commits + 10 + rand.int_max(31)
+			} else if tides && !falling && stats.commits >= tide_turn {
+				falling, tide_turn = true, stats.commits + 200
+			}
 		} else {
 			kv.txn_abort(&txn)
 			stats.aborts += 1
@@ -330,7 +387,11 @@ test_model_randomized :: proc(t: ^testing.T) {
 	log.infof("[seed %d] %v", t.seed, stats)
 
 	// The run must actually exercise everything it claims to.
-	testing.expect(t, stats.puts > 40_000 && stats.overflow_puts > 3_000, "too few puts")
+	testing.expect(t, stats.puts > 20_000 && stats.overflow_puts > 2_000, "too few puts")
+	testing.expect(t, stats.dels > 10_000 && stats.absent_dels > 1_000, "too few deletes")
+	// Falling tides emptied the tree, so it collapsed to nothing and grew
+	// again from an empty root.
+	testing.expect(t, stats.empty_commits >= 2, "the tree was never emptied")
 	testing.expect(t, stats.commits > 100 && stats.aborts > 10, "too few commits or aborts")
 	testing.expect(t, stats.reopens >= 5, "too few reopens")
 	// Readers were held across commits while pages were being reused.
@@ -344,10 +405,12 @@ test_model_until_map_full :: proc(t: ^testing.T) {
 	defer temp_dir_destroy(&dir, DB)
 
 	// Pages are reused, so the map must be smaller than the data 2,000 keys
-	// grow to. At 5 MiB it fills after about 60 commits. No reader is held:
-	// one pins enough pages to fill the map within 12–30 commits, before
-	// much is reused, and filling it with reuse is what this test is for.
-	stats, hit := run_model(t, temp_dir_file(dir, DB), kv.Options{map_size = 5 << 20}, ops = 200_000, keys = 2_000, stop_on_map_full = true, max_held = 0)
+	// grow to, and the tide never falls. Deletes still run, 10% of
+	// operations, so a delete can meet the full map as well as a put. At
+	// 4 MiB it fills after 60–90 commits. No reader is held: one pins enough
+	// pages to fill the map within 12–30 commits, before much is reused, and
+	// filling it with reuse is what this test is for.
+	stats, hit := run_model(t, temp_dir_file(dir, DB), kv.Options{map_size = 4 << 20}, ops = 200_000, keys = 2_000, stop_on_map_full = true, max_held = 0, tides = false)
 	log.infof("[seed %d] %v", t.seed, stats)
 	testing.expect(t, hit, "the map never filled")
 	testing.expect(t, stats.commits > 0, "nothing was committed before the map filled")

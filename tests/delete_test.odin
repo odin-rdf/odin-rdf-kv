@@ -672,3 +672,142 @@ test_del_abort_and_reopen :: proc(t: ^testing.T) {
 	defer kv.txn_abort(&reader2)
 	expect_shape_keys(t, &reader2, N, ..gone[:])
 }
+
+// NFR-003: a reader that began before a commit deleting half the keys (some
+// with overflow values) still reads every one of them, however many commits
+// follow; once it ends, the pages it pinned are reused.
+@(test)
+test_del_reader_keeps_snapshot :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+	env, txn, ok := open_write(t, temp_dir_file(dir, DB))
+	if !ok {
+		return
+	}
+	defer kv.env_close(env)
+
+	N :: 2000
+	for k in 0 ..< N {
+		key: [8]byte
+		kv.put(&txn, u64_key(&key, u64(k)), steady_value(k, 0, env.page_size))
+	}
+	if !commit_ok(t, env, &txn) {
+		return
+	}
+
+	reader, _ := kv.txn_begin(env)
+	txn, _ = kv.txn_begin(env, read_only = false)
+	for k := 0; k < N; k += 2 {
+		del_u64(&txn, k)
+	}
+	if !commit_ok(t, env, &txn) {
+		kv.txn_abort(&reader)
+		return
+	}
+	// More commits, deleting and re-adding, while the reader is held.
+	for round in 1 ..= 20 {
+		txn, _ = kv.txn_begin(env, read_only = false)
+		for _ in 0 ..< 50 {
+			k := 1 + 2 * rand.int_max(N / 2)
+			key: [8]byte
+			if rand.int_max(2) == 0 {
+				del_u64(&txn, k)
+			} else {
+				kv.put(&txn, u64_key(&key, u64(k)), steady_value(k, round, env.page_size))
+			}
+		}
+		if !commit_ok(t, env, &txn) {
+			kv.txn_abort(&reader)
+			return
+		}
+	}
+	testing.expect_value(t, kv.env_stats(env).free_ready, 0)
+
+	overflow := 0
+	for k in 0 ..< N {
+		key: [8]byte
+		got, err := kv.get(&reader, u64_key(&key, u64(k)))
+		if err != .None || !bytes.equal(got, steady_value(k, 0, env.page_size)) {
+			testing.expectf(t, false, "reader: key %d: %v", k, err)
+			break
+		}
+		overflow += int(len(got) > kv.overflow_threshold(env.page_size))
+	}
+	testing.expect(t, overflow > 100, "too few overflow values")
+	testing.expect_value(t, reader.snapshot.entries, N)
+	expect_tree_ok(t, &reader)
+	expect_space_ok(t, &reader)
+	kv.txn_abort(&reader)
+
+	// With the reader gone, the next write transaction may reuse what it
+	// pinned, and the one after puts it to use.
+	last := kv.env_snapshot(env).last_pgno
+	txn, _ = kv.txn_begin(env, read_only = false)
+	testing.expect(t, kv.env_stats(env).free_ready > 0, "nothing released after the reader ended")
+	for k := 0; k < N; k += 2 {
+		key: [8]byte
+		kv.put(&txn, u64_key(&key, u64(k)), steady_value(k, 99, env.page_size))
+	}
+	commit_ok(t, env, &txn)
+	testing.expect_value(t, kv.env_snapshot(env).last_pgno, last)
+}
+
+// Deleting every key frees every page, and loading the same data again
+// fits in them, all but a few pages.
+@(test)
+test_del_everything_then_reload :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+	env, err := kv.env_open(temp_dir_file(dir, DB))
+	testing.expect_value(t, err, kv.Error.None)
+	if err != .None {
+		return
+	}
+	defer kv.env_close(env)
+
+	model := make([]int, STEADY_KEYS, context.temp_allocator)
+	if steady_commit(t, env, model, 0, STEADY_KEYS, fixed_size = true) != .None {
+		return
+	}
+	last := kv.env_snapshot(env).last_pgno
+
+	txn, _ := kv.txn_begin(env, read_only = false)
+	for k in 0 ..< STEADY_KEYS {
+		if del_u64(&txn, k) != .None {
+			testing.expectf(t, false, "del %d failed", k)
+			kv.txn_abort(&txn)
+			return
+		}
+	}
+	if !commit_ok(t, env, &txn) {
+		return
+	}
+	snap := kv.env_snapshot(env)
+	testing.expect(t, snap.root == 0 && snap.depth == 0 && snap.entries == 0, "the tree isn't empty")
+	// Every page but the meta pages and the free list's own run is on the
+	// free list (space_check has proved there is no other owner).
+	stats := kv.env_stats(env)
+	run := freelist_run_len(t, env, snap)
+	testing.expect_value(t, stats.free_ready + stats.free_pending + run, int(snap.last_pgno) - 1)
+
+	// One more commit, so the pages the delete freed are past the horizon
+	// (KV-I-0002 D1); then the reload.
+	txn, _ = kv.txn_begin(env, read_only = false)
+	key: [8]byte
+	kv.put(&txn, u64_key(&key, 0), {1})
+	if !commit_ok(t, env, &txn) {
+		return
+	}
+	if steady_commit(t, env, model, 1, STEADY_KEYS, fixed_size = true) != .None {
+		return
+	}
+	// Not quite every page: the reload can't reuse the pages of the
+	// snapshot it began from (the one-key tree and its free-list run, under
+	// D1), its own free-list run needs pages, and an overflow value needs a
+	// contiguous free run. Measured: 6 pages over 351.
+	growth := int(kv.env_snapshot(env).last_pgno - last)
+	testing.expectf(t, growth * 100 <= 3 * int(last), "the reload added %d pages to %d", growth, last)
+	reader, _ := kv.txn_begin(env)
+	defer kv.txn_abort(&reader)
+	steady_expect(t, &reader, model, fixed_size = true)
+}

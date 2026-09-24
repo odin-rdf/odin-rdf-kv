@@ -17,7 +17,7 @@ STEADY_COMMITS :: #config(KV_STEADY_COMMITS, 10_000)
 #assert(STEADY_COMMITS >= 1_000 && STEADY_COMMITS % 100 == 0)
 
 /*
-The plateau, full-map and long-reader tests make thousands of synced
+The plateau, full-map, long-reader and churn tests make thousands of synced
 commits, several minutes per build configuration, so they are not part of
 the ordinary suite. Run them with -define:KV_STEADY=true, or with
 `scripts/test.sh --steady`, after changing allocation, the free list or
@@ -40,6 +40,11 @@ when #config(KV_STEADY, false) {
 	@(test)
 	test_steady_state_long_reader :: proc(t: ^testing.T) {
 		steady_state_long_reader(t)
+	}
+
+	@(test)
+	test_steady_state_churn :: proc(t: ^testing.T) {
+		steady_state_churn(t)
 	}
 }
 
@@ -472,4 +477,131 @@ steady_state_long_reader :: proc(t: ^testing.T) {
 	latest, _ := kv.txn_begin(env)
 	defer kv.txn_abort(&latest)
 	steady_expect(t, &latest, model)
+}
+
+
+/*
+KV-I-0003 NFR-004: with no readers, inserting and deleting over a moving
+key set keeps the file bounded, as overwriting does (steady_state_plateau).
+
+Ids 0..<1,000 are loaded, then 10⁴ commits (STEADY_COMMITS) each make 1–20
+changes. Half slide the window of live ids: the lowest id is deleted (if a
+change inside the window hasn't already) and the next id above it is
+inserted, so the tree loses keys on its left and gains them on its right,
+and pages merge and split at both ends. The other half toggle a random id
+inside the window, deleting it if present and inserting it otherwise.
+Values are steady_value's, 15% in overflow runs.
+
+The criteria are the plateau's, and for the same reasons: the second half
+of the commits adds at most 1% of the pages it writes, and the file stays
+within twice the size the data first loaded at (the window holds fewer
+live keys after the load, as the toggles thin it out).
+*/
+steady_state_churn :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+
+	env, err := kv.env_open(temp_dir_file(dir, DB))
+	testing.expect_value(t, err, kv.Error.None)
+	if err != .None {
+		return
+	}
+	defer kv.env_close(env)
+	ps := env.page_size
+
+	COMMITS :: STEADY_COMMITS
+	// For each id ever used, the round of its value plus one, or 0 while
+	// absent.
+	present := make([]int, STEADY_KEYS + COMMITS * STEADY_COMMIT_KEYS, context.temp_allocator)
+	model := make([]int, STEADY_KEYS, context.temp_allocator)
+	if steady_commit(t, env, model, 0, STEADY_KEYS) != .None {
+		return
+	}
+	for i in 0 ..< STEADY_KEYS {
+		present[i] = 1
+	}
+	loaded := kv.env_stats(env).last_pgno
+	lo, hi := 0, STEADY_KEYS
+	last, half := loaded, loaded
+	written_late, dels, puts := 0, 0, 0
+
+	for round in 1 ..= COMMITS {
+		txn, begin_err := kv.txn_begin(env, read_only = false)
+		if begin_err != .None {
+			testing.expectf(t, false, "round %d: txn_begin: %v", round, begin_err)
+			return
+		}
+		failed := false
+		for _ in 0 ..< 1 + rand.int_max(STEADY_COMMIT_KEYS) {
+			key: [8]byte
+			ids: [2]int
+			n := 0
+			if rand.int_max(2) == 0 {
+				ids[0], ids[1], n = lo, hi, 2
+				lo += 1
+				hi += 1
+			} else {
+				ids[0], n = lo + rand.int_max(hi - lo), 1
+			}
+			for id in ids[:n] {
+				op_err: kv.Error
+				if present[id] != 0 {
+					op_err = kv.del(&txn, u64_key(&key, u64(id)))
+					present[id] = 0
+					dels += 1
+				} else if id < lo {
+					continue
+				} else {
+					op_err = kv.put(&txn, u64_key(&key, u64(id)), steady_value(id, round, ps))
+					present[id] = round + 1
+					puts += 1
+				}
+				if op_err != .None {
+					testing.expectf(t, false, "[seed %d] round %d: id %d: %v", t.seed, round, id, op_err)
+					failed = true
+					break
+				}
+			}
+			if failed {
+				break
+			}
+		}
+		if round > COMMITS / 2 {
+			written_late += len(txn.write.dirty)
+		}
+		if failed || !commit_ok(t, env, &txn) {
+			kv.txn_abort(&txn)
+			return
+		}
+		last = kv.env_stats(env).last_pgno
+		if round == COMMITS / 2 {
+			half = last
+		}
+	}
+	late_growth := int(last - half)
+	log.infof("[seed %d] loaded at last_pgno %d; %d after %d commits, %d after %d; %d puts and %d deletes; window [%d, %d); the second half wrote %d pages and added %d; %v",
+		t.seed, loaded, half, COMMITS / 2, last, COMMITS, puts, dels, lo, hi, written_late, late_growth, kv.env_stats(env))
+	testing.expectf(t, late_growth * 100 <= written_late, "[seed %d] the second half of the commits added %d pages, more than 1%% of the %d it wrote", t.seed, late_growth, written_late)
+	testing.expectf(t, last <= 2 * loaded, "[seed %d] the file grew to %d pages, from %d", t.seed, last, loaded)
+
+	reader, _ := kv.txn_begin(env)
+	defer kv.txn_abort(&reader)
+	live: u64
+	for round, id in present {
+		key: [8]byte
+		got, get_err := kv.get(&reader, u64_key(&key, u64(id)))
+		if round == 0 {
+			if get_err != .Not_Found {
+				testing.expectf(t, false, "id %d: %v, want Not_Found", id, get_err)
+				return
+			}
+			continue
+		}
+		live += 1
+		if get_err != .None || !slice.equal(got, steady_value(id, round - 1, ps)) {
+			testing.expectf(t, false, "id %d: %v, or not the value of round %d", id, get_err, round - 1)
+			return
+		}
+	}
+	testing.expect_value(t, reader.snapshot.entries, live)
 }
