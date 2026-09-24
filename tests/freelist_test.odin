@@ -473,8 +473,8 @@ test_space_check_catches_leak_and_double :: proc(t: ^testing.T) {
 // Validation at open, with hand-written runs
 
 // A free list written by hand: the run's page, its records, and header and
-// meta fields that default to what a commit would write.
-@(private = "file")
+// meta fields that default to what a commit would write. Also used by
+// bench_test.odin.
 Hand_List :: struct {
 	records:        []kv.Free_Record,
 	run:            kv.Pgno,
@@ -493,7 +493,6 @@ Hand_List :: struct {
 	options:        kv.Options,
 }
 
-@(private = "file")
 HAND_TXN :: 5
 @(private = "file")
 HAND_LAST_PGNO :: 40
@@ -510,7 +509,6 @@ hand_records :: proc() -> []kv.Free_Record {
 // list says otherwise) holds `list`, and whose older one (txn 4) has no free
 // list, then opens it. The tree is empty unless the list gives a root.
 // Returns the env on success.
-@(private = "file")
 open_hand_list :: proc(t: ^testing.T, path: string, list: Hand_List) -> (env: ^kv.Env, err: kv.Error) {
 	ps := kv.DEFAULT_PAGE_SIZE
 	count := len(list.records) if list.count == -1 else list.count

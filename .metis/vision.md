@@ -39,7 +39,11 @@ The upstream C sources in `liblmdb/` are a reference for comparison. This design
 ## Current State
 
 - The design was discussed and agreed in conversation (2026-09-23). It is recorded here.
-- KV-I-0001 (build steps 1–3) is implemented in the `kv` package (2026-09-24): the file format, open with meta-page selection, read and write transactions with copy-on-write, overflow values, commit, and cursors. It has 79 tests on macOS and Linux and is awaiting review. Delete, page reuse, the memory budget and crash testing remain.
+- KV-I-0001 (build steps 1–3) is implemented in the `kv` package (2026-09-24): the file format, open with meta-page selection, read and write transactions with copy-on-write, overflow values, commit, and cursors. It has 79 tests on macOS and Linux.
+- KV-I-0002 (build step 5, page reuse) is implemented (2026-09-24) and awaiting review: a reader table, a persistent free list rewritten at every commit, reuse of freed pages under the horizon `min(oldest reader, S − 1)`, `space_check`, and `env_stats`. The suite has 107 tests on macOS and Linux. Its Results section has the evidence and the measurements:
+  - **Page reuse criterion:** with no readers the file stays bounded instead of growing with every commit. Under a random workload it follows the high-water mark of the data plus the pages in flight, which still rises now and then, ever more rarely: from 352 pages of data, about 490 after 10⁴ commits and 500 after 10⁵.
+  - **The flat free list's rewrite cost** is about 4.5 ns per record, under 1% of a synced commit up to 10⁴ records, so the extent fallback isn't needed for cost. Placing the list's own run in a fragmented pool, and linear run searches, are the known weak points (backlog: KV-T-0014, KV-T-0015).
+- Delete (step 4), the memory budget (step 6) and crash testing (step 7) remain.
 - Toolchain: Odin `dev-2026-09`. The development platform is macOS (Darwin). Linux is also a target.
 
 ## Future State

@@ -19,7 +19,8 @@ read_meta :: proc(t: ^testing.T, env: ^kv.Env, slot: int) -> (meta: kv.Meta, val
 	return meta, meta.magic == kv.MAGIC && u64(meta.checksum) == kv.meta_checksum(&meta)
 }
 
-// Puts even_entries(n) in one write transaction and commits it.
+// Puts `entries` in one write transaction and commits it, then checks the
+// new snapshot with space_check and tree_check.
 commit_entries :: proc(t: ^testing.T, env: ^kv.Env, entries: []Entry) -> bool {
 	txn, err := kv.txn_begin(env, read_only = false)
 	testing.expect_value(t, err, kv.Error.None)
@@ -35,7 +36,7 @@ commit_entries :: proc(t: ^testing.T, env: ^kv.Env, entries: []Entry) -> bool {
 	}
 	commit_err := kv.txn_commit(&txn)
 	testing.expect_value(t, commit_err, kv.Error.None)
-	return commit_err == .None
+	return commit_err == .None && expect_latest_ok(t, env)
 }
 
 @(test)

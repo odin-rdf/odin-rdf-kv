@@ -61,18 +61,6 @@ expect_round :: proc(t: ^testing.T, txn: ^kv.Txn, n, round: int, loc := #caller_
 	return expect_tree_ok(t, txn, loc) && expect_space_ok(t, txn, loc)
 }
 
-// space_check and tree_check on the latest snapshot, with a new reader.
-@(private = "file")
-expect_latest_ok :: proc(t: ^testing.T, env: ^kv.Env, loc := #caller_location) -> bool {
-	reader, err := kv.txn_begin(env)
-	testing.expect_value(t, err, kv.Error.None, loc = loc)
-	if err != .None {
-		return false
-	}
-	defer kv.txn_abort(&reader)
-	return expect_tree_ok(t, &reader, loc) && expect_space_ok(t, &reader, loc)
-}
-
 /*
 Begins a write transaction and allocates single pages until page_alloc
 extends the file, which it only does once every reusable page is taken.

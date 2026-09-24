@@ -9,6 +9,24 @@ import kv "../kv"
 
 Model_Stats :: struct {
 	puts, overflow_puts, gets, scans, commits, aborts, reopens: int,
+	// Read transactions held across commits and checked on release, the
+	// commits they were held across in total, and pages that commits wrote
+	// in place of a page of the file they began from (reused pages).
+	held_readers, held_commits, reused_pages:                 int,
+}
+
+// At most this many read transactions are held at once.
+MODEL_HELD_READERS :: 4
+
+// A read transaction run_model holds across commits, with the committed
+// model it began at.
+@(private = "file")
+Held_Reader :: struct {
+	txn:     kv.Txn,
+	model:   Model,
+	// Stats.commits when it began, and when it is to be released.
+	begun:   int,
+	release: int,
 }
 
 /*
@@ -29,8 +47,14 @@ The workload:
 
 Transactions last 1–500 operations; 85% commit and 15% abort. The database
 is closed and reopened about every 10,000 operations.
+
+Alongside the writer, up to `max_held` read transactions are held:
+each begins at a random operation, with a copy of the committed model, and
+is released after 1–20 further commits (or before a reopen). On release it
+must still match the model it began at, by model_diff and space_check, so a
+page reused while a reader could still see it is caught.
 */
-run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, keys: int, stop_on_map_full := false) -> (stats: Model_Stats, hit_map_full: bool) {
+run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, keys: int, stop_on_map_full := false, max_held := MODEL_HELD_READERS) -> (stats: Model_Stats, hit_map_full: bool) {
 	seed := t.seed
 	ks := key_space_make(keys)
 	committed := make(Model, keys, context.temp_allocator)
@@ -48,7 +72,16 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 
 	txn: kv.Txn
 	defer kv.txn_abort(&txn)
+	held: [MODEL_HELD_READERS]Held_Reader
+	for &h in held {
+		h.model = make(Model, keys, context.temp_allocator)
+	}
+	// Runs before env_close; ending a reader twice is harmless.
+	defer for &h in held {
+		kv.txn_abort(&h.txn)
+	}
 	in_txn := false
+	begin_last: kv.Pgno
 	txn_ops, txn_limit := 0, 0
 	last_reopen := 0
 	version: u32
@@ -63,6 +96,24 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			copy(working, committed)
 			in_txn = true
 			txn_ops, txn_limit = 0, 1 + rand.int_max(500)
+			begin_last = txn.snapshot.last_pgno
+		}
+
+		// Now and then a reader begins on the last commit and is held.
+		if rand.int_max(500) == 0 {
+			for &h in held[:max_held] {
+				if h.txn.env != nil && !h.txn.done {
+					continue
+				}
+				h.txn, err = kv.txn_begin(env)
+				if err != .None {
+					testing.expectf(t, false, "[seed %d] op %d: reader txn_begin: %v", seed, op, err)
+					return
+				}
+				copy(h.model, committed)
+				h.begun, h.release = stats.commits, stats.commits + 1 + rand.int_max(20)
+				break
+			}
 		}
 
 		id := rand.int_max(keys)
@@ -91,6 +142,9 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			}
 			if put_err == .Map_Full && stop_on_map_full {
 				kv.txn_abort(&txn)
+				if !held_release(t, held[:], ks, value_buf, &stats, seed, all = true) {
+					return
+				}
 				return stats, map_full_reopen(t, &env, path, options, ks, committed, value_buf, seed)
 			}
 			if put_err != .None {
@@ -153,9 +207,17 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			return
 		}
 		if rand.int_max(100) < 85 || op == ops - 1 {
+			for pgno in txn.write.dirty {
+				if pgno <= begin_last {
+					stats.reused_pages += 1
+				}
+			}
 			commit_err := kv.txn_commit(&txn)
 			if commit_err == .Map_Full && stop_on_map_full {
 				// The commit's free-list run didn't fit (KV-I-0002 D6).
+				if !held_release(t, held[:], ks, value_buf, &stats, seed, all = true) {
+					return
+				}
 				return stats, map_full_reopen(t, &env, path, options, ks, committed, value_buf, seed)
 			}
 			if commit_err != .None {
@@ -172,8 +234,12 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 		if !verify_committed(t, env, ks, committed, value_buf, "after commit/abort", seed) {
 			return
 		}
+		reopen := op - last_reopen >= 10_000
+		if !held_release(t, held[:], ks, value_buf, &stats, seed, all = reopen) {
+			return
+		}
 
-		if op - last_reopen >= 10_000 {
+		if reopen {
 			kv.env_close(env)
 			env, err = kv.env_open(path, options)
 			testing.expect_value(t, err, kv.Error.None)
@@ -211,6 +277,33 @@ verify_committed :: proc(t: ^testing.T, env: ^kv.Env, ks: Key_Space, m: Model, b
 	return true
 }
 
+/*
+Releases the held readers that are due (all of them with `all`), each
+after checking that it still sees exactly the model it began at: every key
+by `get`, full scans both ways, tree_check and space_check. Its snapshot's
+free-list run and pages must all be intact, whatever was reused since.
+*/
+@(private = "file")
+held_release :: proc(t: ^testing.T, held: []Held_Reader, ks: Key_Space, buf: []byte, stats: ^Model_Stats, seed: u64, all: bool) -> bool {
+	for &h in held {
+		if h.txn.env == nil || h.txn.done || (!all && h.release > stats.commits) {
+			continue
+		}
+		defer kv.txn_abort(&h.txn)
+		stats.held_readers += 1
+		stats.held_commits += stats.commits - h.begun
+		phase := "held reader on release"
+		if !model_compare(t, &h.txn, ks, h.model, buf, phase, seed) {
+			return false
+		}
+		if ok, reason := kv.space_check(&h.txn, context.allocator); !ok {
+			testing.expectf(t, false, "[seed %d] %s: space_check: %s", seed, phase, reason)
+			return false
+		}
+	}
+	return true
+}
+
 // After a Map_Full with stop_on_map_full: reopens the database and checks
 // that it is still at the last commit. The transaction has already ended.
 @(private = "file")
@@ -240,6 +333,9 @@ test_model_randomized :: proc(t: ^testing.T) {
 	testing.expect(t, stats.puts > 40_000 && stats.overflow_puts > 3_000, "too few puts")
 	testing.expect(t, stats.commits > 100 && stats.aborts > 10, "too few commits or aborts")
 	testing.expect(t, stats.reopens >= 5, "too few reopens")
+	// Readers were held across commits while pages were being reused.
+	testing.expect(t, stats.held_readers >= 50 && stats.held_commits >= 5 * stats.held_readers, "too few readers held")
+	testing.expect(t, stats.reused_pages > 10_000, "too few pages reused")
 }
 
 @(test)
@@ -248,8 +344,10 @@ test_model_until_map_full :: proc(t: ^testing.T) {
 	defer temp_dir_destroy(&dir, DB)
 
 	// Pages are reused, so the map must be smaller than the data 2,000 keys
-	// grow to. At 5 MiB it fills after about 60 commits.
-	stats, hit := run_model(t, temp_dir_file(dir, DB), kv.Options{map_size = 5 << 20}, ops = 200_000, keys = 2_000, stop_on_map_full = true)
+	// grow to. At 5 MiB it fills after about 60 commits. No reader is held:
+	// one pins enough pages to fill the map within 12–30 commits, before
+	// much is reused, and filling it with reuse is what this test is for.
+	stats, hit := run_model(t, temp_dir_file(dir, DB), kv.Options{map_size = 5 << 20}, ops = 200_000, keys = 2_000, stop_on_map_full = true, max_held = 0)
 	log.infof("[seed %d] %v", t.seed, stats)
 	testing.expect(t, hit, "the map never filled")
 	testing.expect(t, stats.commits > 0, "nothing was committed before the map filled")

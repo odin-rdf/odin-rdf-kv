@@ -12,6 +12,9 @@ import "core:time"
 import kv "../kv"
 
 // Puts one small entry and commits it, returning the new snapshot's txn_id.
+// space_check runs on the write transaction just before the commit, rather
+// than on a new reader after it, which would change the reader table these
+// tests inspect.
 @(private = "file")
 commit_one :: proc(t: ^testing.T, env: ^kv.Env, i: int) -> kv.Txn_Id {
 	txn, err := kv.txn_begin(env, read_only = false)
@@ -22,6 +25,7 @@ commit_one :: proc(t: ^testing.T, env: ^kv.Env, i: int) -> kv.Txn_Id {
 	defer kv.txn_abort(&txn)
 	key := fmt.tprintf("key%05d", i)
 	testing.expect_value(t, kv.put(&txn, transmute([]byte)key, transmute([]byte)key), kv.Error.None)
+	expect_space_ok(t, &txn)
 	testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
 	return kv.env_snapshot(env).txn_id
 }

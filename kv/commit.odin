@@ -102,12 +102,14 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 	meta_write(env, int(snap.txn_id & 1), meta) or_return
 	os_sync(env.fd) or_return
 
-	sync.mutex_lock(&env.snapshot_mutex)
-	env.snapshot = snap^
-	sync.mutex_unlock(&env.snapshot_mutex)
 	// Still under writer_mutex, which the transaction holds until it ends.
 	free_state_destroy(&env.free)
 	env.free = next
+	sync.mutex_lock(&env.snapshot_mutex)
+	env.snapshot = snap^
+	env.stats.free_ready = len(next.ready)
+	env.stats.free_pending = len(next.pending)
+	sync.mutex_unlock(&env.snapshot_mutex)
 	return .None
 }
 
@@ -126,5 +128,8 @@ file_grow :: proc(env: ^Env, needed: i64) -> Error {
 
 	os_truncate(env.fd, size) or_return
 	env.file_size = size
+	sync.mutex_lock(&env.snapshot_mutex)
+	env.stats.file_pages = int(size) / env.page_size
+	sync.mutex_unlock(&env.snapshot_mutex)
 	return .None
 }

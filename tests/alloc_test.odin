@@ -32,6 +32,7 @@ test_reads_allocate_nothing :: proc(t: ^testing.T) {
 			kv.put(&txn, ks.keys[id], model_value(id, {true, 1, size}, value_buf))
 		}
 		testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
+		expect_latest_ok(t, env)
 	}
 
 	txn, _ := kv.txn_begin(env)

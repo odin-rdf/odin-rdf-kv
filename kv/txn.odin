@@ -106,11 +106,15 @@ txn_begin :: proc(env: ^Env, read_only := true) -> (txn: Txn, err: Error) {
 		// Whatever the transaction does later, that stays true, so it is
 		// done in place rather than at commit.
 		w := txn.write
+		n_ready := len(env.free.ready)
 		if rel_err := freelist_release(&env.free, w.oldest, virtual.arena_allocator(&w.arena)); rel_err != .None {
 			virtual.arena_destroy(&w.arena)
 			free(w, env.allocator)
 			sync.mutex_unlock(&env.writer_mutex)
 			return {}, rel_err
+		}
+		if len(env.free.ready) != n_ready {
+			stats_update_free(env)
 		}
 	}
 

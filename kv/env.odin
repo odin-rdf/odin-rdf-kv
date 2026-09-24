@@ -46,6 +46,34 @@ Reader_Slot :: struct {
 	count:  int,
 }
 
+/*
+Figures about an Env, as returned by env_stats. They are read together
+under one lock, so they describe one instant, but they can be stale as
+soon as env_stats returns. A write transaction in progress shows in none of
+them until it commits.
+
+Step 6 (the memory budget) extends this with the resident estimate, dirty
+pages, spills and evictions; code that builds a Stats should name its
+fields.
+*/
+Stats :: struct {
+	// The last page of the latest committed snapshot.
+	last_pgno:     Pgno,
+	// Pages in the file. The file grows ahead of last_pgno in steps (see
+	// FILE_GROWTH_MIN), and never shrinks.
+	file_pages:    int,
+	// Free pages that a write transaction beginning now may reuse. The
+	// release at txn_begin moves pending pages here, so after readers end
+	// this count only catches up when the next write transaction begins.
+	free_ready:    int,
+	// Free pages still waiting for older snapshots to end (KV-I-0002 REQ-002).
+	free_pending:  int,
+	// Live read transactions.
+	readers:       int,
+	// The oldest snapshot a live read transaction holds, or 0 if none does.
+	oldest_reader: Txn_Id,
+}
+
 Env :: struct {
 	fd:             posix.FD,
 	map_base:       [^]byte,
@@ -65,6 +93,11 @@ Env :: struct {
 	// The free list of the last commit. Owned by the writer: only used with
 	// writer_mutex held, and replaced by a commit once it is durable.
 	free:           Free_State,
+	// The writer's figures for env_stats: file_pages, free_ready and
+	// free_pending, copied from file_size and `free` whenever the writer
+	// changes those. Guarded by snapshot_mutex, so env_stats never waits
+	// for a write transaction to end. The other fields are unused.
+	stats:          Stats,
 	// Number of transactions not yet ended, updated atomically. Checked by
 	// env_close in debug builds.
 	active_txns:    int,
@@ -129,6 +162,8 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 		free      = free_state,
 		allocator = allocator,
 	}
+	env.stats.file_pages = int(file_size) / meta_page_size
+	stats_update_free(env)
 	return env, .None
 }
 
@@ -151,6 +186,36 @@ env_snapshot :: proc(env: ^Env) -> Snapshot {
 	sync.mutex_lock(&env.snapshot_mutex)
 	defer sync.mutex_unlock(&env.snapshot_mutex)
 	return env.snapshot
+}
+
+/*
+Returns figures about the environment (see Stats). Safe to call from any
+thread, including one with a transaction open: it only takes snapshot_mutex,
+briefly, and never waits for a write transaction to end. The free-page
+counts are those of the last commit, plus any release done since by a
+beginning write transaction; a write transaction in progress doesn't change
+them until it commits.
+*/
+env_stats :: proc(env: ^Env) -> Stats {
+	sync.mutex_lock(&env.snapshot_mutex)
+	defer sync.mutex_unlock(&env.snapshot_mutex)
+	stats := env.stats
+	stats.last_pgno = env.snapshot.last_pgno
+	for slot in env.readers {
+		stats.readers += slot.count
+	}
+	stats.oldest_reader, _ = oldest_reader(env)
+	return stats
+}
+
+// Copies the sizes of Env.free into Env.stats. The caller is the writer, or
+// env_open; it holds writer_mutex but not snapshot_mutex.
+@(private)
+stats_update_free :: proc(env: ^Env) {
+	sync.mutex_lock(&env.snapshot_mutex)
+	env.stats.free_ready = len(env.free.ready)
+	env.stats.free_pending = len(env.free.pending)
+	sync.mutex_unlock(&env.snapshot_mutex)
 }
 
 // Returns the oldest snapshot held by a live read transaction, or false if
