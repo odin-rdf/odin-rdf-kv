@@ -13,9 +13,13 @@ Makes the transaction's changes durable and visible to new transactions,
 then ends it. The steps are ordered so that a crash at any point leaves the
 previous commit intact:
 
-1. Build the new free list and allocate a run for it (see freelist.odin).
+1. Build the new free list and allocate a run for it (see freelist.odin),
+   in reusable pages if a run of them fits, otherwise at the end of the
+   file.
 2. Grow the file if needed and write every dirty page, the run included.
-   These are all new pages that no committed meta page refers to yet.
+   No committed meta page refers to any of them: they are new pages, or
+   reused ones that were freed before the snapshot the transaction began
+   from (whose meta page stays intact) and that no live reader can see.
 3. Sync, so the pages are on disk before anything points at them.
 4. Write the meta page for txn_id + 1 into the slot the previous commit
    didn't use, then sync it.
@@ -23,10 +27,12 @@ previous commit intact:
    replace the env's free list.
 
 On failure the transaction is aborted and the error returned; the database
-and the env's free list stay at the previous commit. If only the final sync
-fails, the new meta page may or may not have reached the disk: the next
-open sees whichever state is durable, and this process keeps the previous
-one.
+and the env's free list stay at the previous commit, including the pages
+the transaction took from it. Map_Full here means the free list's run fit
+neither in reusable pages nor in the map (KV-I-0002 D6). If only the final
+sync fails, the new meta page may or may not have reached the disk: the
+next open sees whichever state is durable, and this process keeps the
+previous one.
 
 Committing a read-only transaction, or a write transaction that changed
 nothing, just ends it. Committing a transaction that failed part-way returns
@@ -59,15 +65,11 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 	defer if err != .None {
 		free_state_destroy(&next)
 	}
-	count := free_state_count(next)
-	run: Pgno
-	if count > 0 {
-		pages := freelist_run_pages(env.page_size, count)
-		buf: []byte
-		run, buf = page_alloc(txn, pages) or_return
-		freelist_write(buf, run, pages, next)
+	run, run_pages, run_buf := freelist_place(txn, &next) or_return
+	if run_pages > 0 {
+		freelist_write(run_buf, run, run_pages, next)
 	}
-	snap.freelist_pgno, snap.freelist_count = run, u64(count)
+	snap.freelist_pgno, snap.freelist_count = run, u64(free_state_count(next))
 
 	file_grow(env, (i64(snap.last_pgno) + 1) * ps) or_return
 

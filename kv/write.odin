@@ -1,32 +1,164 @@
 package kv
 
 import "core:mem/virtual"
+import "core:slice"
 
 /*
-Allocates `n` contiguous new pages at the end of the database and registers
-them as dirty. The returned buffer is page-aligned and `n` pages long; the
-caller initialises it.
+Allocates `n` contiguous pages and registers them as dirty. The returned
+buffer is page-aligned, `n` pages long and new: a reused page's old
+contents are never read. The caller initialises it.
+
+The pages come from the first of these with room:
+- for a single page, the transaction's loose pages;
+- the reusable pages on the free list: for a single page the lowest one
+  the transaction hasn't taken yet, for a run the lowest run of `n`
+  consecutive ones (KV-I-0002 D5). Env.free itself doesn't change; the
+  transaction records what it took (see Write_State);
+- the end of the database, which grows by `n` pages.
+
+Returns Map_Full if none of them has room.
 */
 page_alloc :: proc(txn: ^Txn, n: int) -> (pgno: Pgno, buf: []byte, err: Error) {
-	ps := txn.env.page_size
-	if !pages_available(txn, n) {
+	w := txn.write
+	if n == 1 && len(w.loose) > 0 {
+		buf = dirty_buf_alloc(txn, n) or_return
+		pgno = pop(&w.loose)
+	} else if idx, found := ready_run_find(txn, n); found {
+		buf = dirty_buf_alloc(txn, n) or_return
+		pgno = ready_take(txn, idx, n) or_return
+	} else {
+		return page_alloc_end(txn, n)
+	}
+	w.dirty[pgno] = buf
+	return pgno, buf, .None
+}
+
+// Allocates `n` new pages at the end of the database, as page_alloc does.
+@(private)
+page_alloc_end :: proc(txn: ^Txn, n: int) -> (pgno: Pgno, buf: []byte, err: Error) {
+	if end_room(txn) < n {
 		return 0, nil, .Map_Full
 	}
-	alloc_err: virtual.Allocator_Error
-	buf, alloc_err = virtual.arena_alloc(&txn.write.arena, uint(n * ps), uint(ps))
-	if alloc_err != nil {
-		return 0, nil, .Out_Of_Memory
-	}
+	buf = dirty_buf_alloc(txn, n) or_return
 	pgno = txn.snapshot.last_pgno + 1
 	txn.snapshot.last_pgno += Pgno(n)
 	txn.write.dirty[pgno] = buf
 	return pgno, buf, .None
 }
 
-// Whether `n` more pages fit in the map.
+// A page-aligned buffer for `n` dirty pages, from the transaction's arena.
+@(private)
+dirty_buf_alloc :: proc(txn: ^Txn, n: int) -> (buf: []byte, err: Error) {
+	ps := txn.env.page_size
+	alloc_err: virtual.Allocator_Error
+	buf, alloc_err = virtual.arena_alloc(&txn.write.arena, uint(n * ps), uint(ps))
+	if alloc_err != nil {
+		return nil, .Out_Of_Memory
+	}
+	return buf, .None
+}
+
+// Number of pages that still fit in the map after the snapshot's last page.
 @(private = "file")
-pages_available :: proc(txn: ^Txn, n: int) -> bool {
-	return (int(txn.snapshot.last_pgno) + 1 + n) * txn.env.page_size <= txn.env.map_size
+end_room :: proc(txn: ^Txn) -> int {
+	return txn.env.map_size / txn.env.page_size - int(txn.snapshot.last_pgno) - 1
+}
+
+/*
+Finds the lowest run of `n` consecutive pages in Env.free.ready that `txn`
+hasn't taken, ignoring the lowest `skip` untaken pages. Returns the index of
+its first page. For n = 1 that is the lowest untaken page.
+*/
+@(private = "file")
+ready_run_find :: proc(txn: ^Txn, n: int, skip := 0) -> (idx: int, ok: bool) {
+	w := txn.write
+	ready, taken := txn.env.free.ready[:], w.taken[:]
+	skip := skip
+	start, length := 0, 0
+	for i in w.ready_next ..< len(ready) {
+		p := ready[i]
+		for len(taken) > 0 && taken[0] < p {
+			taken = taken[1:]
+		}
+		if len(taken) > 0 && taken[0] == p {
+			length = 0
+			continue
+		}
+		if skip > 0 {
+			skip -= 1
+			continue
+		}
+		if length > 0 && p == ready[i - 1] + 1 {
+			length += 1
+		} else {
+			start, length = i, 1
+		}
+		if length == n {
+			return start, true
+		}
+	}
+	return 0, false
+}
+
+/*
+Takes the `n` pages of Env.free.ready from index `idx`, as found by
+ready_run_find, and returns the first. A single page is the lowest untaken
+one, so every page before it is taken already and ready_next moves past it.
+A run is recorded in `taken` instead.
+*/
+@(private = "file")
+ready_take :: proc(txn: ^Txn, idx: int, n: int) -> (pgno: Pgno, err: Error) {
+	w := txn.write
+	run := txn.env.free.ready[idx:idx + n]
+	if n == 1 {
+		w.ready_next = idx + 1
+	} else {
+		pos, _ := slice.binary_search(w.taken[:], run[0])
+		if _, inject_err := inject_at_elems(&w.taken, pos, ..run); inject_err != nil {
+			return 0, .Out_Of_Memory
+		}
+	}
+	w.ready_taken += n
+	return run[0], .None
+}
+
+// Whether `txn` has taken page `pgno` from Env.free.ready.
+@(private)
+ready_is_taken :: proc(txn: ^Txn, pgno: Pgno) -> bool {
+	w := txn.write
+	i, found := slice.binary_search(txn.env.free.ready[:], pgno)
+	if !found {
+		return false
+	}
+	if i < w.ready_next {
+		return true
+	}
+	_, found = slice.binary_search(w.taken[:], pgno)
+	return found
+}
+
+/*
+Whether `singles` single pages and, unless `run` is 0, one run of `run`
+pages are sure to be available, whatever order page_alloc is asked for
+them in. Loose pages, untaken reusable pages and the room left in the map
+count for single pages. The run needs the room at the end of the map, or a
+run of reusable pages that survives the single pages taking the lowest
+reusable pages first. Conservative, so that a change that passes it can't
+hit Map_Full part-way.
+*/
+@(private = "file")
+pages_available :: proc(txn: ^Txn, singles: int, run := 0) -> bool {
+	w := txn.write
+	end := end_room(txn)
+	untaken := len(txn.env.free.ready) - w.ready_taken
+	if singles + run > end + len(w.loose) + untaken {
+		return false
+	}
+	if run == 0 || run <= end {
+		return true
+	}
+	_, found := ready_run_find(txn, run, skip = clamp(singles - len(w.loose), 0, untaken))
+	return found
 }
 
 /*
@@ -64,7 +196,7 @@ a slice returned by `get` in the same write transaction: the insert moves
 bytes around within those pages. Copy such data first.
 
 Returns `Map_Full` without changing anything if the worst case of this put
-might not fit in the map. Any other failure after the tree has started to
+might not fit in the reusable pages and the room left in the map. Any other failure after the tree has started to
 change leaves the transaction unusable: later calls return the same error,
 and it can only be aborted.
 */
@@ -82,14 +214,14 @@ put :: proc(txn: ^Txn, key, value: []byte) -> Error {
 	if len(value) > int(max(u32)) {
 		return .Invalid_Argument
 	}
-	// Worst case: an overflow run for the value, then copy every page on the
-	// path, split every level, and add a new root. Checking up front means a
-	// full map never leaves a half-done change behind.
-	needed := 2 * int(txn.snapshot.depth) + 1
+	// Worst case: copy every page on the path, an overflow run for the
+	// value, then split every level and add a new root. Checking up front
+	// means a full map never leaves a half-done change behind.
+	singles, run := 2 * int(txn.snapshot.depth) + 1, 0
 	if leaf_needs_overflow(ps, len(key), len(value)) {
-		needed += overflow_pages(ps, len(value))
+		run = overflow_pages(ps, len(value))
 	}
-	if !pages_available(txn, needed) {
+	if !pages_available(txn, singles, run) {
 		return .Map_Full
 	}
 

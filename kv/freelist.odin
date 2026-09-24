@@ -1,5 +1,6 @@
 package kv
 
+import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
@@ -21,6 +22,12 @@ next commit frees them like any other page of the previous snapshot.
 
 In memory the committed list is an Env's Free_State: the tag-0 pages as a
 sorted array, and the rest as records.
+
+A write transaction reuses pages freed by a transaction ≤ its horizon
+(Write_State.oldest): at begin, those records move from `pending` to
+`ready`, and page_alloc takes from `ready` without changing it. The commit
+builds the next list without the pages taken, and places its own run in
+reusable pages when it can.
 */
 
 Free_Record :: struct {
@@ -159,12 +166,55 @@ freelist_load :: proc(base: [^]byte, page_size: int, snap: Snapshot, allocator :
 }
 
 /*
+Moves the pending records freed by a transaction ≤ `oldest` into `ready`,
+keeping it sorted: a merge from the back, in place. `scratch` holds a sorted
+copy of the pages moved. On Out_Of_Memory the state is unchanged.
+*/
+@(private)
+freelist_release :: proc(state: ^Free_State, oldest: Txn_Id, scratch: runtime.Allocator) -> Error {
+	// Pending records are ordered by txn_id, so the eligible ones come first.
+	n := 0
+	for n < len(state.pending) && Txn_Id(state.pending[n].txn_id) <= oldest {
+		n += 1
+	}
+	if n == 0 {
+		return .None
+	}
+	pages, alloc_err := make([]Pgno, n, scratch)
+	if alloc_err != nil {
+		return .Out_Of_Memory
+	}
+	for r, i in state.pending[:n] {
+		pages[i] = Pgno(r.pgno)
+	}
+	slice.sort(pages)
+	old_len := len(state.ready)
+	if resize(&state.ready, old_len + n) != nil {
+		return .Out_Of_Memory
+	}
+
+	// Fill from the back, so no page is overwritten before it has moved.
+	i, j := old_len - 1, n - 1
+	for k := old_len + n - 1; j >= 0; k -= 1 {
+		if i >= 0 && state.ready[i] > pages[j] {
+			state.ready[k] = state.ready[i]
+			i -= 1
+		} else {
+			state.ready[k] = pages[j]
+			j -= 1
+		}
+	}
+	remove_range(&state.pending, 0, n)
+	return .None
+}
+
+/*
 Builds the free list that committing `txn` leaves behind, allocated with the
 env allocator. Env.free itself is not changed; the commit swaps the result
 in once it is durable. With S the snapshot the transaction began from:
 
-- tag 0: the pages reusable now, plus this transaction's loose pages, which
-  no reader ever saw;
+- tag 0: the pages reusable now that the transaction didn't take, plus its
+  loose pages, which no reader ever saw;
 - the pending records, unchanged;
 - tag S + 1: the pages this transaction freed and the previous free-list
   run. Snapshot S still uses them.
@@ -198,9 +248,20 @@ freelist_build :: proc(txn: ^Txn) -> (next: Free_State, err: Error) {
 		return next, .Out_Of_Memory
 	}
 
-	// Merge the two sorted lists of reusable pages.
-	a, b := env.free.ready[:], w.loose[:]
+	// Merge the two sorted lists of reusable pages, leaving out the pages
+	// taken: those before ready_next, and those in `taken`. A page taken
+	// and then dropped again is loose, so it is still listed once.
+	a, b, taken := env.free.ready[w.ready_next:], w.loose[:], w.taken[:]
 	for len(a) > 0 || len(b) > 0 {
+		if len(a) > 0 {
+			for len(taken) > 0 && taken[0] < a[0] {
+				taken = taken[1:]
+			}
+			if len(taken) > 0 && taken[0] == a[0] {
+				a = a[1:]
+				continue
+			}
+		}
 		if len(b) == 0 || (len(a) > 0 && a[0] < b[0]) {
 			append(&next.ready, a[0])
 			a = a[1:]
@@ -215,6 +276,62 @@ freelist_build :: proc(txn: ^Txn) -> (next: Free_State, err: Error) {
 		append(&next.pending, Free_Record{pgno = u64le(pgno), txn_id = tag})
 	}
 	return next, .None
+}
+
+/*
+Allocates the run for `next`, the free list being committed, registered as
+a dirty page of `txn`. Returns its first page, its length and its buffer,
+or 0, 0 and nil for an empty list.
+
+The run comes from the list's own reusable pages when it can: the lowest
+run of consecutive ones (D5), which then leave the list. Taking j pages
+leaves n − j records, and the run must be exactly the length they need,
+because that is how a run is validated at open. The needed length only
+falls as j grows, so at most one j fits, and it is at most the j = 0 length;
+if no j fits, or no run of that length is free, the run extends the file.
+If the map has no room for that either, the commit fails with Map_Full
+(KV-I-0002 D6).
+*/
+@(private)
+freelist_place :: proc(txn: ^Txn, next: ^Free_State) -> (pgno: Pgno, pages: int, buf: []byte, err: Error) {
+	ps := txn.env.page_size
+	n := free_state_count(next^)
+	if n == 0 {
+		return 0, 0, nil, .None
+	}
+	k := freelist_run_pages(ps, n)
+	for j in 1 ..= min(k, n - 1) {
+		if freelist_run_pages(ps, n - j) != j {
+			continue
+		}
+		idx, found := sorted_run_find(next.ready[:], j)
+		if !found {
+			break
+		}
+		pgno = next.ready[idx]
+		buf = dirty_buf_alloc(txn, j) or_return
+		txn.write.dirty[pgno] = buf
+		remove_range(&next.ready, idx, idx + j)
+		return pgno, j, buf, .None
+	}
+	pgno, buf = page_alloc_end(txn, k) or_return
+	return pgno, k, buf, .None
+}
+
+// Returns the index of the lowest run of `n` consecutive page numbers in
+// the sorted `pages`.
+@(private = "file")
+sorted_run_find :: proc(pages: []Pgno, n: int) -> (idx: int, ok: bool) {
+	start := 0
+	for i in 0 ..< len(pages) {
+		if i > 0 && pages[i] != pages[i - 1] + 1 {
+			start = i
+		}
+		if i - start + 1 == n {
+			return start, true
+		}
+	}
+	return 0, false
 }
 
 // Writes `state` into `buf`, the run of `pages` pages allocated for it at

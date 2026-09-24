@@ -48,9 +48,23 @@ Write_State :: struct {
 	// them on the free list, tagged with its own txn_id.
 	freed: [dynamic]Pgno,
 	// Pages this transaction allocated and then dropped again (a replaced
-	// overflow run). No reader ever saw them, so the commit puts them on the
-	// free list as reusable.
+	// overflow run). No reader ever saw them, so page_alloc hands them out
+	// again first, and the commit puts the rest on the free list as
+	// reusable.
 	loose: [dynamic]Pgno,
+	// The reuse horizon, computed once when the transaction began: pages
+	// freed by a transaction ≤ oldest are reusable. It is the oldest
+	// snapshot a live reader holds, or the snapshot before the one this
+	// transaction began from if that is older (KV-I-0002 D1, D4).
+	oldest: Txn_Id,
+	// The pages this transaction took from Env.free.ready, which isn't
+	// changed until the commit is durable: every page before index
+	// `ready_next` (single pages, taken in order), and the pages in
+	// `taken`, sorted (runs, taken from anywhere after it). `ready_taken`
+	// counts them both.
+	ready_next:  int,
+	taken:       [dynamic]Pgno,
+	ready_taken: int,
 }
 
 // Begins a transaction. Read-only transactions never block and are never
@@ -68,6 +82,7 @@ txn_begin :: proc(env: ^Env, read_only := true) -> (txn: Txn, err: Error) {
 		w.dirty = make(map[Pgno][]byte, arena)
 		w.freed = make([dynamic]Pgno, arena)
 		w.loose = make([dynamic]Pgno, arena)
+		w.taken = make([dynamic]Pgno, arena)
 		txn.write = w
 	}
 
@@ -81,13 +96,46 @@ txn_begin :: proc(env: ^Env, read_only := true) -> (txn: Txn, err: Error) {
 			sync.mutex_unlock(&env.snapshot_mutex)
 			return {}, reg_err
 		}
+	} else {
+		txn.write.oldest = reuse_horizon(env, txn.snapshot.txn_id)
 	}
 	sync.mutex_unlock(&env.snapshot_mutex)
+
+	if !read_only {
+		// Pages that became reusable since the last commit move to `ready`.
+		// Whatever the transaction does later, that stays true, so it is
+		// done in place rather than at commit.
+		w := txn.write
+		if rel_err := freelist_release(&env.free, w.oldest, virtual.arena_allocator(&w.arena)); rel_err != .None {
+			virtual.arena_destroy(&w.arena)
+			free(w, env.allocator)
+			sync.mutex_unlock(&env.writer_mutex)
+			return {}, rel_err
+		}
+	}
 
 	txn.env = env
 	txn.read_only = read_only
 	sync.atomic_add(&env.active_txns, 1)
 	return txn, .None
+}
+
+/*
+Returns the reuse horizon for a write transaction beginning from snapshot
+`s`: the oldest snapshot a live reader holds, or s − 1 if that is older.
+Pages freed by a transaction ≤ the horizon are in no snapshot anyone can
+still read. Keeping s − 1 intact is KV-I-0002 D1: the meta page the next
+commit overwrites still holds it, and env_open falls back to it if meta
+page s is ever unreadable. The caller holds snapshot_mutex.
+*/
+@(private = "file")
+reuse_horizon :: proc(env: ^Env, s: Txn_Id) -> Txn_Id {
+	// Nothing is tagged 0, so an empty database's horizon can be 0.
+	oldest := s - 1 if s > 0 else 0
+	if reader, ok := oldest_reader(env); ok {
+		oldest = min(oldest, reader)
+	}
+	return oldest
 }
 
 // Ends the transaction, discarding any changes. Safe to call more than once,

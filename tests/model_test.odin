@@ -83,6 +83,12 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			version += 1
 			spec := Val_Spec{true, version, size}
 			put_err := kv.put(&txn, key, model_value(id, spec, value_buf))
+			if put_err == .Map_Full && txn.err != .None {
+				// The up-front check must refuse a put before it changes
+				// anything, reusable pages or not (KV-I-0002 REQ-007).
+				testing.expectf(t, false, "[seed %d] op %d: put hit Map_Full part-way", seed, op)
+				return
+			}
 			if put_err == .Map_Full && stop_on_map_full {
 				kv.txn_abort(&txn)
 				return stats, map_full_reopen(t, &env, path, options, ks, committed, value_buf, seed)
@@ -226,8 +232,7 @@ test_model_randomized :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, DB)
 
-	// Without page reuse the file grows with every commit, so reserve
-	// plenty of address space.
+	// Plenty of address space, so the run never hits Map_Full.
 	stats, _ := run_model(t, temp_dir_file(dir, DB), kv.Options{map_size = 4 << 30}, ops = 100_000, keys = 3_000)
 	log.infof("[seed %d] %v", t.seed, stats)
 
@@ -242,7 +247,9 @@ test_model_until_map_full :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, DB)
 
-	stats, hit := run_model(t, temp_dir_file(dir, DB), kv.Options{map_size = 8 << 20}, ops = 200_000, keys = 2_000, stop_on_map_full = true)
+	// Pages are reused, so the map must be smaller than the data 2,000 keys
+	// grow to. At 5 MiB it fills after about 60 commits.
+	stats, hit := run_model(t, temp_dir_file(dir, DB), kv.Options{map_size = 5 << 20}, ops = 200_000, keys = 2_000, stop_on_map_full = true)
 	log.infof("[seed %d] %v", t.seed, stats)
 	testing.expect(t, hit, "the map never filled")
 	testing.expect(t, stats.commits > 0, "nothing was committed before the map filled")

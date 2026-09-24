@@ -24,7 +24,9 @@ Checks that every page in [2, last_pgno] visible to `txn` has exactly one
 owner: the tree (its pages and overflow runs, walked as by tree_check), the
 free-list run, or a free-list record. In a write transaction, the pages it
 has freed or dropped (`freed` and `loose`) are owners too; the free list is
-the one the transaction began from. Pages 0 and 1 are the meta pages.
+the one the transaction began from, less the pages the transaction took
+from it, which the tree or `loose` owns now. Pages 0 and 1 are the meta
+pages.
 
 This is the check that catches a leaked page or one owned twice. Meant for
 tests; it allocates a bit per page with `allocator`.
@@ -48,6 +50,9 @@ space_check :: proc(txn: ^Txn, allocator := context.temp_allocator) -> (ok: bool
 			}
 		}
 		for r in records {
+			if txn.write != nil && ready_is_taken(txn, Pgno(r.pgno)) {
+				continue
+			}
 			if mark_ok, mark_reason := mark_free(&c, Pgno(r.pgno)); !mark_ok {
 				return false, mark_reason
 			}

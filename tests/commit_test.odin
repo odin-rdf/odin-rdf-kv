@@ -2,6 +2,7 @@ package kv_tests
 
 import "core:bytes"
 import "core:fmt"
+import "core:math/rand"
 import "core:slice"
 import "core:sync"
 import "core:sys/posix"
@@ -161,6 +162,75 @@ test_commit_falls_back_when_newest_meta_damaged :: proc(t: ^testing.T) {
 	expect_even_entries(t, &txn, 500)
 	expect_tree_ok(t, &txn)
 	expect_space_ok(t, &txn)
+}
+
+// The same after many overwrite commits, each reusing pages freed two
+// commits before it: the pages of snapshot S − 1 are never among them.
+@(test)
+test_commit_falls_back_after_heavy_reuse :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+	path := temp_dir_file(dir, DB)
+
+	env, err := kv.env_open(path)
+	testing.expect_value(t, err, kv.Error.None)
+	if err != .None {
+		return
+	}
+	N :: 1_000
+	COMMITS :: 200
+	value :: proc(i, round: int) -> []byte {
+		return transmute([]byte)fmt.tprintf("%d_%d", i, round)
+	}
+	// The round that last wrote each key, after the latest commit and after
+	// the one before it.
+	model := make([]int, N, context.temp_allocator)
+	previous := make([]int, N, context.temp_allocator)
+	most_pages := 0
+	for round in 0 ..< COMMITS {
+		txn, _ := kv.txn_begin(env, read_only = false)
+		copy(previous, model)
+		for j in 0 ..< (N if round == 0 else 1 + rand.int_max(50)) {
+			i := j if round == 0 else rand.int_max(N)
+			key: [8]byte
+			kv.put(&txn, u64_key(&key, u64(i)), value(i, round))
+			model[i] = round
+		}
+		testing.expect_value(t, txn.err, kv.Error.None)
+		testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
+		reader, _ := kv.txn_begin(env)
+		space_ok := expect_space_ok(t, &reader)
+		kv.txn_abort(&reader)
+		if !space_ok {
+			break
+		}
+		most_pages = max(most_pages, int(kv.env_snapshot(env).last_pgno))
+	}
+	s := kv.env_snapshot(env)
+	testing.expect_value(t, s.txn_id, COMMITS)
+	// Without reuse every commit would add at least a path and a run.
+	testing.expect(t, most_pages < COMMITS, "pages were not reused")
+	kv.env_close(env)
+
+	corrupt_meta(t, path, int(s.txn_id & 1))
+	env2, reader, ok := open_read(t, path)
+	if !ok {
+		return
+	}
+	defer kv.env_close(env2)
+	defer kv.txn_abort(&reader)
+	testing.expect_value(t, reader.snapshot.txn_id, s.txn_id - 1)
+	testing.expect_value(t, reader.snapshot.entries, N)
+	for i in 0 ..< N {
+		key: [8]byte
+		got, get_err := kv.get(&reader, u64_key(&key, u64(i)))
+		if get_err != .None || string(got) != string(value(i, previous[i])) {
+			testing.expectf(t, false, "key %d: got %q, %v", i, string(got), get_err)
+			break
+		}
+	}
+	expect_tree_ok(t, &reader)
+	expect_space_ok(t, &reader)
 }
 
 @(test)

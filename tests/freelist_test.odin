@@ -99,12 +99,20 @@ test_freelist_round_trip :: proc(t: ^testing.T) {
 	want: Expected_Free
 	want.ready = make([dynamic]kv.Pgno, context.temp_allocator)
 	want.pending = make([dynamic]kv.Free_Record, context.temp_allocator)
-	loose_seen, freed_seen, runs_seen := 0, 0, 0
+	loose_seen, freed_seen, runs_seen, reused_seen, runs_reused := 0, 0, 0, 0, 0
 
 	for commit in 1 ..= 60 {
 		txn, begin_err := kv.txn_begin(env, read_only = false)
 		testing.expect_value(t, begin_err, kv.Error.None)
 		if begin_err != .None {
+			return
+		}
+		// With no readers, beginning makes every page freed before the
+		// snapshot reusable: all but the ones the snapshot itself freed.
+		s := u64le(txn.snapshot.txn_id)
+		testing.expect_value(t, txn.write.oldest, kv.Txn_Id(max(s, 1) - 1))
+		release_before(&want, s)
+		if !expect_free(t, env, want, on_disk = false) {
 			return
 		}
 		for _ in 0 ..< 1 + rand.int_max(200) {
@@ -125,10 +133,23 @@ test_freelist_round_trip :: proc(t: ^testing.T) {
 		testing.expect_value(t, txn.err, kv.Error.None)
 		expect_space_ok(t, &txn)
 
-		// What the commit should add: loose pages as reusable, and the
-		// freed pages plus the previous run tagged with the new txn_id.
+		// What the commit should leave: the reusable pages and the loose
+		// ones, less every page the transaction wrote and the new run; and
+		// the freed pages plus the previous run tagged with the new txn_id.
 		tag := u64le(txn.snapshot.txn_id + 1)
-		append(&want.ready, ..txn.write.loose[:])
+		last_before := txn.snapshot.last_pgno
+		written := dirty_pages(&txn)
+		for p in want.ready {
+			if slice.contains(written, p) {
+				reused_seen += 1
+			}
+		}
+		for p in txn.write.loose {
+			if !slice.contains(want.ready[:], p) {
+				append(&want.ready, p)
+			}
+		}
+		remove_pages(&want.ready, written)
 		added := make([dynamic]kv.Pgno, context.temp_allocator)
 		append(&added, ..txn.write.freed[:])
 		if run := txn.snapshot.freelist_pgno; run != 0 {
@@ -145,6 +166,21 @@ test_freelist_round_trip :: proc(t: ^testing.T) {
 		freed_seen += len(txn.write.freed)
 
 		testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
+		// The new run is in reusable pages, or at the end of the file.
+		snap := kv.env_snapshot(env)
+		if snap.freelist_pgno != 0 {
+			run := make([]kv.Pgno, kv.freelist_run_pages(ps, int(snap.freelist_count)), context.temp_allocator)
+			for &p, i in run {
+				p = snap.freelist_pgno + kv.Pgno(i)
+			}
+			if snap.freelist_pgno <= last_before {
+				runs_reused += 1
+				for p in run {
+					testing.expectf(t, slice.contains(want.ready[:], p), "run page %d was not reusable", p)
+				}
+			}
+			remove_pages(&want.ready, run)
+		}
 		if !expect_free(t, env, want) || !expect_committed_space_ok(t, env) {
 			return
 		}
@@ -160,18 +196,8 @@ test_freelist_round_trip :: proc(t: ^testing.T) {
 				env = nil
 				return
 			}
-			s := u64le(kv.env_snapshot(env).txn_id)
-			kept := 0
-			for r in want.pending {
-				if r.txn_id < s {
-					append(&want.ready, kv.Pgno(r.pgno))
-				} else {
-					want.pending[kept] = r
-					kept += 1
-				}
-			}
-			resize(&want.pending, kept)
-			testing.expect(t, kept > 0, "nothing pending after reopen")
+			release_before(&want, u64le(kv.env_snapshot(env).txn_id))
+			testing.expect(t, len(want.pending) > 0, "nothing pending after reopen")
 			testing.expect(t, slice.equal(read_freelist(t, env, kv.env_snapshot(env)), disk), "run changed by reopening")
 			if !expect_free(t, env, want, on_disk = false) || !expect_committed_space_ok(t, env) {
 				return
@@ -179,6 +205,50 @@ test_freelist_round_trip :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, loose_seen > 0 && freed_seen > 0 && runs_seen > 0, "the free list was not exercised")
+	testing.expect(t, reused_seen > 0 && runs_reused > 0, "no page was reused")
+}
+
+// Moves the expected pending records tagged before `s` to the ready pages,
+// as a write transaction beginning from `s` with no readers does.
+@(private = "file")
+release_before :: proc(want: ^Expected_Free, s: u64le) {
+	kept := 0
+	for r in want.pending {
+		if r.txn_id < s {
+			append(&want.ready, kv.Pgno(r.pgno))
+		} else {
+			want.pending[kept] = r
+			kept += 1
+		}
+	}
+	resize(&want.pending, kept)
+	slice.sort(want.ready[:])
+}
+
+// Every page a write transaction has written so far, overflow runs
+// included (temp allocator).
+dirty_pages :: proc(txn: ^kv.Txn) -> []kv.Pgno {
+	pages := make([dynamic]kv.Pgno, context.temp_allocator)
+	for pgno, buf in txn.write.dirty {
+		for i in 0 ..< len(buf) / txn.env.page_size {
+			append(&pages, pgno + kv.Pgno(i))
+		}
+	}
+	slice.sort(pages[:])
+	return pages[:]
+}
+
+// Removes every page in `pages` from `list`, keeping its order.
+@(private = "file")
+remove_pages :: proc(list: ^[dynamic]kv.Pgno, pages: []kv.Pgno) {
+	kept := 0
+	for p in list {
+		if !slice.contains(pages, p) {
+			list[kept] = p
+			kept += 1
+		}
+	}
+	resize(list, kept)
 }
 
 @(test)
@@ -266,15 +336,19 @@ test_freelist_io_error_leaves_free_unchanged :: proc(t: ^testing.T) {
 		commit_entries(t, env, even_entries(500 + 100 * i))
 	}
 	before := kv.env_snapshot(env)
+
+	// The list as it is once the transaction has begun: beginning moves the
+	// newly reusable records to `ready`, the one change it may make.
+	txn, _ := kv.txn_begin(env, read_only = false)
 	ready := slice.clone(env.free.ready[:], context.temp_allocator)
 	pending := slice.clone(env.free.pending[:], context.temp_allocator)
-	testing.expect(t, len(pending) > 0, "nothing on the free list")
-
-	txn, _ := kv.txn_begin(env, read_only = false)
+	testing.expect(t, len(ready) > 0 && len(pending) > 0, "nothing on the free list")
 	for i in 0 ..< 2_000 {
 		key: [8]byte
 		kv.put(&txn, u64_key(&key, u64(i)), transmute([]byte)string("lost"))
 	}
+	testing.expect_value(t, txn.write.ready_taken, len(ready))
+	expect_space_ok(t, &txn)
 	fd := env.fd
 	env.fd = posix.FD(-1)
 	testing.expect_value(t, kv.txn_commit(&txn), kv.Error.Io)
@@ -322,8 +396,10 @@ test_freelist_run_map_full :: proc(t: ^testing.T) {
 	pending := slice.clone(env.free.pending[:], context.temp_allocator)
 
 	// Change one key, then take every page left in the map, so the run has
-	// nowhere to go.
+	// nowhere to go. Nothing is reusable yet: the only freed pages are the
+	// ones commit 2 freed, which snapshot 1 still uses (KV-I-0002 D1).
 	txn, _ := kv.txn_begin(env, read_only = false)
+	testing.expect_value(t, len(env.free.ready), 0)
 	key: [8]byte
 	testing.expect_value(t, kv.put(&txn, u64_key(&key, 0), transmute([]byte)string("x")), kv.Error.None)
 	left := env.map_size / env.page_size - int(txn.snapshot.last_pgno) - 1
@@ -409,6 +485,12 @@ Hand_List :: struct {
 	header_pgno:    kv.Pgno,
 	// -1: the pages the records need.
 	overflow_count: int,
+	// 0: HAND_LAST_PGNO.
+	last_pgno:      kv.Pgno,
+	// If not 0, the tree is one leaf at this page holding the key "k".
+	root:           kv.Pgno,
+	// Passed to env_open when the database is opened.
+	options:        kv.Options,
 }
 
 @(private = "file")
@@ -424,15 +506,18 @@ hand_records :: proc() -> []kv.Free_Record {
 	return slice.clone(records, context.temp_allocator)
 }
 
-// Writes an empty database whose newest meta page (txn 5, last_pgno 40)
-// holds `list`, and whose older one (txn 4) has no free list, then opens
-// it. Returns the env on success.
+// Writes a database whose newest meta page (txn 5, last_pgno 40 unless the
+// list says otherwise) holds `list`, and whose older one (txn 4) has no free
+// list, then opens it. The tree is empty unless the list gives a root.
+// Returns the env on success.
 @(private = "file")
 open_hand_list :: proc(t: ^testing.T, path: string, list: Hand_List) -> (env: ^kv.Env, err: kv.Error) {
+	ps := kv.DEFAULT_PAGE_SIZE
 	count := len(list.records) if list.count == -1 else list.count
 	flags := list.flags if list.flags != 0 else kv.PAGE_FREELIST
 	header_pgno := list.header_pgno if list.header_pgno != 0 else list.run
-	overflow_count := list.overflow_count if list.overflow_count != -1 else kv.freelist_run_pages(kv.DEFAULT_PAGE_SIZE, count)
+	overflow_count := list.overflow_count if list.overflow_count != -1 else kv.freelist_run_pages(ps, count)
+	last := list.last_pgno if list.last_pgno != 0 else HAND_LAST_PGNO
 
 	{
 		w, open_err := kv.env_open(path)
@@ -441,26 +526,38 @@ open_hand_list :: proc(t: ^testing.T, path: string, list: Hand_List) -> (env: ^k
 			return nil, open_err
 		}
 		defer kv.env_close(w)
-		testing.expect_value(t, kv.os_truncate(w.fd, (HAND_LAST_PGNO + 1) * kv.DEFAULT_PAGE_SIZE), kv.Error.None)
-		if list.run >= 2 && list.run <= HAND_LAST_PGNO {
-			buf: Page_Buf
-			page := buf.bytes[:]
-			h := kv.page_header(page)
+		testing.expect_value(t, kv.os_truncate(w.fd, (i64(last) + 1) * i64(ps)), kv.Error.None)
+		if list.run >= 2 && list.run <= last {
+			// The records may span several pages.
+			pages := kv.freelist_run_pages(ps, len(list.records))
+			bufs := make([]Page_Buf, pages, context.temp_allocator)
+			run := mem.slice_to_bytes(bufs)
+			h := kv.page_header(run)
 			h.pgno = u64le(header_pgno)
 			h.flags = u16le(flags)
 			h.overflow_count = u32le(overflow_count)
-			records := ([^]kv.Free_Record)(&page[kv.PAGE_HEADER_SIZE])[:len(list.records)]
+			records := ([^]kv.Free_Record)(&run[kv.PAGE_HEADER_SIZE])[:len(list.records)]
 			copy(records, list.records)
-			write_page(t, w, list.run, page)
+			for i in 0 ..< pages {
+				write_page(t, w, list.run + kv.Pgno(i), run[i * ps:][:ps])
+			}
 		}
-		older := make_meta(HAND_TXN - 1, last_pgno = HAND_LAST_PGNO)
-		newer := make_meta(HAND_TXN, last_pgno = HAND_LAST_PGNO)
+		older := make_meta(HAND_TXN - 1, last_pgno = u64(last))
+		newer := make_meta(HAND_TXN, last_pgno = u64(last))
 		newer.freelist_pgno = u64le(list.run)
 		newer.freelist_count = u64le(count)
+		if list.root != 0 {
+			buf: Page_Buf
+			leaf := buf.bytes[:]
+			kv.page_init(leaf, list.root, kv.PAGE_LEAF)
+			kv.leaf_insert(leaf, 0, transmute([]byte)string("k"), transmute([]byte)string("v"))
+			write_page(t, w, list.root, leaf)
+			newer.root, newer.depth, newer.entries = u64le(list.root), 1, 1
+		}
 		testing.expect_value(t, kv.meta_write(w, 0, older), kv.Error.None)
 		testing.expect_value(t, kv.meta_write(w, 1, newer), kv.Error.None)
 	}
-	return kv.env_open(path)
+	return kv.env_open(path, list.options)
 }
 
 @(test)
@@ -511,6 +608,166 @@ test_freelist_load_rejects_bad_lists :: proc(t: ^testing.T) {
 		env, err := open_hand_list(t, temp_dir_file(dir, DB), list)
 		testing.expectf(t, err == .Corrupted, "%s: env_open returned %v", c.name, err)
 		if env != nil {
+			kv.env_close(env)
+		}
+		temp_dir_destroy(&dir, DB)
+	}
+}
+
+// page_alloc hands out the lowest reusable page, or the lowest run of
+// consecutive ones, skipping what the transaction took; never a pending
+// page; and extends the file only when nothing reusable fits. Env.free is
+// not changed.
+@(test)
+test_page_alloc_reuses_lowest_first :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+
+	// Reusable: 3 4 | 6 7 8 | 11 12 13 14 | 16. Pending (tag 5): 9 and 10.
+	records := []kv.Free_Record{{3, 0}, {4, 0}, {6, 0}, {7, 0}, {8, 0}, {11, 0}, {12, 0}, {13, 0}, {14, 0}, {16, 0}, {9, 5}, {10, 5}}
+	env, err := open_hand_list(t, temp_dir_file(dir, DB), {records = slice.clone(records, context.temp_allocator), run = 30, count = -1, overflow_count = -1})
+	testing.expect_value(t, err, kv.Error.None)
+	if err != .None {
+		return
+	}
+	defer kv.env_close(env)
+	ready := slice.clone(env.free.ready[:], context.temp_allocator)
+	pending := slice.clone(env.free.pending[:], context.temp_allocator)
+	testing.expect(t, slice.equal(ready, []kv.Pgno{3, 4, 6, 7, 8, 11, 12, 13, 14, 16}), "wrong ready pages")
+
+	txn, _ := kv.txn_begin(env, read_only = false)
+	defer kv.txn_abort(&txn)
+	// The snapshot is txn 5, so what it freed stays pending.
+	testing.expect_value(t, txn.write.oldest, HAND_TXN - 1)
+	testing.expect(t, slice.equal(env.free.pending[:], pending), "pending records released")
+
+	Step :: struct {
+		n:    int,
+		want: kv.Pgno,
+	}
+	steps := []Step {
+		{1, 3}, // the lowest page
+		{2, 6}, // 4 alone is too short
+		{1, 4},
+		{1, 8}, // 6 and 7 are taken
+		{4, 11},
+		{2, HAND_LAST_PGNO + 1}, // only 16 is left: extend
+		{1, 16},
+		{1, HAND_LAST_PGNO + 3},
+	}
+	for step, i in steps {
+		pgno, buf, alloc_err := kv.page_alloc(&txn, step.n)
+		testing.expectf(t, alloc_err == .None && pgno == step.want, "step %d: page_alloc(%d) = %d, %v; want %d", i, step.n, pgno, alloc_err, step.want)
+		testing.expectf(t, len(buf) == step.n * env.page_size && raw_data(txn.write.dirty[pgno]) == raw_data(buf), "step %d: buffer not registered", i)
+	}
+	testing.expect(t, slice.equal(txn.write.taken[:], []kv.Pgno{6, 7, 11, 12, 13, 14}), "wrong runs taken")
+	testing.expect_value(t, txn.write.ready_next, len(ready))
+	testing.expect_value(t, txn.write.ready_taken, len(ready))
+	testing.expect_value(t, txn.snapshot.last_pgno, HAND_LAST_PGNO + 3)
+	testing.expect(t, slice.equal(env.free.ready[:], ready), "ready pages changed")
+	testing.expect(t, slice.equal(env.free.pending[:], pending), "pending records changed")
+}
+
+// `n` tag-0 records for pages first, first + 1, ... (temp allocator).
+@(private = "file")
+ready_records :: proc(first: kv.Pgno, n: int) -> []kv.Free_Record {
+	records := make([]kv.Free_Record, n, context.temp_allocator)
+	for &r, i in records {
+		r.pgno = u64le(first + kv.Pgno(i))
+	}
+	return records
+}
+
+// The commit's run goes into reusable pages only when it can be exactly as
+// long as the records left after taking it need; otherwise it extends the
+// file. Either way the list it writes opens again.
+@(test)
+test_freelist_run_length_fits_its_records :: proc(t: ^testing.T) {
+	Case :: struct {
+		// Reusable pages 2, 3, ..., and how many single pages the
+		// transaction takes from the front of them.
+		ready, taken: int,
+		// Where the new run should go, its records, and last_pgno after.
+		run:          kv.Pgno,
+		count:        u64,
+		last:         kv.Pgno,
+	}
+	LAST :: 400
+	cases := []Case {
+		// 99 left plus the old run's page: 100 records, 1 page. Taking a
+		// page leaves 99, which still need 1.
+		{ready = 100, taken = 1, run = 3, count = 99, last = LAST},
+		// 254 left plus the old run's 2 pages: 256 records need 2 pages,
+		// but taking 2 leaves 254, which need 1, and taking 1 leaves 255,
+		// which need 1: a 1-page run in reusable pages.
+		{ready = 256, taken = 2, run = 4, count = 255, last = LAST},
+		// 255 left plus 2: 257 records. Taking 1 leaves 256, which need
+		// 2; taking 2 leaves 255, which need 1. No length fits, so the
+		// run extends the file.
+		{ready = 256, taken = 1, run = LAST + 1, count = 257, last = LAST + 2},
+	}
+	for c in cases {
+		dir := temp_dir_create(t)
+		path := temp_dir_file(dir, DB)
+		env, err := open_hand_list(t, path, {records = ready_records(2, c.ready), run = 300, count = -1, overflow_count = -1, last_pgno = LAST})
+		testing.expectf(t, err == .None, "ready %d: env_open returned %v", c.ready, err)
+		if err == .None {
+			txn, _ := kv.txn_begin(env, read_only = false)
+			for _ in 0 ..< c.taken {
+				kv.page_alloc(&txn, 1)
+			}
+			testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
+			snap := kv.env_snapshot(env)
+			testing.expectf(t, snap.freelist_pgno == c.run && snap.freelist_count == c.count && snap.last_pgno == c.last,
+				"ready %d, taken %d: run %d with %d records, last_pgno %d", c.ready, c.taken, snap.freelist_pgno, snap.freelist_count, snap.last_pgno)
+			kv.env_close(env)
+			env, err = kv.env_open(path)
+			testing.expectf(t, err == .None, "ready %d, taken %d: reopening returned %v", c.ready, c.taken, err)
+			if env != nil {
+				kv.env_close(env)
+			}
+		}
+		temp_dir_destroy(&dir, DB)
+	}
+}
+
+// With the map full, a put of an overflow value is accepted only if a
+// reusable run for it survives the single pages the put takes first, which
+// come from the lowest reusable pages. Otherwise it is refused up front
+// rather than failing part-way.
+@(test)
+test_put_needs_a_run_the_path_leaves :: proc(t: ^testing.T) {
+	Case :: struct {
+		ready: []kv.Free_Record,
+		want:  kv.Error,
+	}
+	cases := []Case {
+		// Copying the path takes page 2, breaking the only run of 3.
+		{{{2, 0}, {3, 0}, {4, 0}, {10, 0}, {20, 0}, {30, 0}}, .Map_Full},
+		// The path takes 2; the run 10–12 is left for the value.
+		{{{2, 0}, {3, 0}, {4, 0}, {10, 0}, {11, 0}, {12, 0}}, .None},
+	}
+	for c in cases {
+		dir := temp_dir_create(t)
+		path := temp_dir_file(dir, DB)
+		// 64 pages fill the 256 KiB map exactly.
+		env, err := open_hand_list(t, path, {records = slice.clone(c.ready, context.temp_allocator), run = 40, count = -1, overflow_count = -1, last_pgno = 63, root = 63, options = {map_size = 256 * 1024}})
+		testing.expect_value(t, err, kv.Error.None)
+		if err == .None {
+			testing.expect_value(t, env.map_size, 64 * env.page_size)
+			txn, _ := kv.txn_begin(env, read_only = false)
+			value := patterned(2 * env.page_size, 1)
+			testing.expect_value(t, kv.overflow_pages(env.page_size, len(value)), 3)
+			put_err := kv.put(&txn, transmute([]byte)string("big"), value)
+			testing.expectf(t, put_err == c.want && txn.err == .None, "put returned %v, transaction error %v; want %v", put_err, txn.err, c.want)
+			if put_err == .None {
+				testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
+				reader, _ := kv.txn_begin(env)
+				got, get_err := kv.get(&reader, transmute([]byte)string("big"))
+				testing.expect(t, get_err == .None && slice.equal(got, value), "value differs")
+				kv.txn_abort(&reader)
+			}
+			kv.txn_abort(&txn)
 			kv.env_close(env)
 		}
 		temp_dir_destroy(&dir, DB)
