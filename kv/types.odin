@@ -28,7 +28,8 @@ Error :: enum u8 {
 	Locked,
 	// An option or argument is out of range, such as an invalid page size.
 	Invalid_Argument,
-	// Memory for a write transaction's dirty pages couldn't be allocated.
+	// Memory couldn't be allocated: for a write transaction's dirty pages,
+	// or for the environment or its reader table.
 	Out_Of_Memory,
 }
 

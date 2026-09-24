@@ -54,7 +54,8 @@ Write_State :: struct {
 }
 
 // Begins a transaction. Read-only transactions never block and are never
-// blocked by the writer.
+// blocked by the writer. A read transaction holds its snapshot in the
+// reader table until it ends; one that is never ended pins it forever.
 txn_begin :: proc(env: ^Env, read_only := true) -> (txn: Txn, err: Error) {
 	if !read_only {
 		sync.mutex_lock(&env.writer_mutex)
@@ -70,11 +71,17 @@ txn_begin :: proc(env: ^Env, read_only := true) -> (txn: Txn, err: Error) {
 		txn.write = w
 	}
 
-	// Page reuse (step 5) will also register the snapshot's txn_id in the
-	// reader table here, under the same lock, so that a writer computing the
-	// oldest reader can't miss this one.
+	// A reader registers its snapshot under the same lock that copies it, so
+	// a writer computing the oldest reader can't miss it: the snapshot is
+	// either still the latest one or already in the table.
 	sync.mutex_lock(&env.snapshot_mutex)
 	txn.snapshot = env.snapshot
+	if read_only {
+		if reg_err := reader_register(env, txn.snapshot.txn_id); reg_err != .None {
+			sync.mutex_unlock(&env.snapshot_mutex)
+			return {}, reg_err
+		}
+	}
 	sync.mutex_unlock(&env.snapshot_mutex)
 
 	txn.env = env
@@ -94,6 +101,11 @@ txn_abort :: proc(txn: ^Txn) {
 	if txn.write != nil {
 		write_state_free(txn)
 		sync.mutex_unlock(&txn.env.writer_mutex)
+	}
+	if txn.read_only {
+		sync.mutex_lock(&txn.env.snapshot_mutex)
+		reader_deregister(txn.env, txn.snapshot.txn_id)
+		sync.mutex_unlock(&txn.env.snapshot_mutex)
 	}
 	sync.atomic_sub(&txn.env.active_txns, 1)
 }

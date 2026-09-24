@@ -2,6 +2,7 @@ package kv
 
 import "base:runtime"
 import "core:mem"
+import "core:slice"
 import "core:sync"
 import "core:sys/posix"
 
@@ -31,6 +32,17 @@ Snapshot :: struct {
 	entries:   u64,
 }
 
+// Initial capacity of the reader table. Readers mostly share the latest
+// snapshot, so a few slots cover the usual case.
+READER_TABLE_CAPACITY :: 16
+
+// One entry of the reader table: `count` live read transactions hold the
+// snapshot `txn_id`. Slots with a count of 0 are removed.
+Reader_Slot :: struct {
+	txn_id: Txn_Id,
+	count:  int,
+}
+
 Env :: struct {
 	fd:             posix.FD,
 	map_base:       [^]byte,
@@ -41,6 +53,10 @@ Env :: struct {
 	// The last committed state. Guarded by snapshot_mutex.
 	snapshot:       Snapshot,
 	snapshot_mutex: sync.Mutex,
+	// Snapshots held by live read transactions, sorted by txn_id with one
+	// slot per snapshot, so readers[0] is the oldest. Guarded by
+	// snapshot_mutex, and allocated with `allocator`.
+	readers:        [dynamic]Reader_Slot,
 	// Held for the whole lifetime of a write transaction.
 	writer_mutex:   sync.Mutex,
 	// Number of transactions not yet ended, updated atomically. Checked by
@@ -82,7 +98,15 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 		return nil, .Corrupted
 	}
 
-	env = new(Env, allocator)
+	readers, readers_err := make([dynamic]Reader_Slot, 0, READER_TABLE_CAPACITY, allocator)
+	if readers_err != nil {
+		return nil, .Out_Of_Memory
+	}
+	env, _ = new(Env, allocator)
+	if env == nil {
+		delete(readers)
+		return nil, .Out_Of_Memory
+	}
 	env^ = Env {
 		fd        = fd,
 		map_base  = base,
@@ -90,6 +114,7 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 		page_size = meta_page_size,
 		file_size = file_size,
 		snapshot  = snapshot_from_meta(meta),
+		readers   = readers,
 		allocator = allocator,
 	}
 	return env, .None
@@ -100,9 +125,11 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 env_close :: proc(env: ^Env) {
 	when ODIN_DEBUG {
 		assert(sync.atomic_load(&env.active_txns) == 0, "env_close with active transactions")
+		assert(len(env.readers) == 0, "env_close with registered readers")
 	}
 	os_unmap(env.map_base, env.map_size)
 	os_close(env.fd)
+	delete(env.readers)
 	free(env, env.allocator)
 }
 
@@ -111,6 +138,60 @@ env_snapshot :: proc(env: ^Env) -> Snapshot {
 	sync.mutex_lock(&env.snapshot_mutex)
 	defer sync.mutex_unlock(&env.snapshot_mutex)
 	return env.snapshot
+}
+
+// Returns the oldest snapshot held by a live read transaction, or false if
+// there are none. The answer can be stale as soon as it returns; it's meant
+// for tests and statistics.
+env_oldest_reader :: proc(env: ^Env) -> (txn_id: Txn_Id, ok: bool) {
+	sync.mutex_lock(&env.snapshot_mutex)
+	defer sync.mutex_unlock(&env.snapshot_mutex)
+	return oldest_reader(env)
+}
+
+// Returns the oldest snapshot in the reader table. The caller holds
+// snapshot_mutex.
+@(private)
+oldest_reader :: proc(env: ^Env) -> (txn_id: Txn_Id, ok: bool) {
+	if len(env.readers) == 0 {
+		return 0, false
+	}
+	return env.readers[0].txn_id, true
+}
+
+// Registers a read transaction on `txn_id`, the current snapshot. The caller
+// holds snapshot_mutex. Snapshots are published in increasing order, so the
+// new reader either joins the last slot or appends one; the table only
+// allocates when it outgrows its largest size so far.
+@(private)
+reader_register :: proc(env: ^Env, txn_id: Txn_Id) -> Error {
+	if n := len(env.readers); n > 0 {
+		last := &env.readers[n - 1]
+		assert(last.txn_id <= txn_id, "reader snapshot older than a registered one")
+		if last.txn_id == txn_id {
+			last.count += 1
+			return .None
+		}
+	}
+	if _, err := append(&env.readers, Reader_Slot{txn_id, 1}); err != nil {
+		return .Out_Of_Memory
+	}
+	return .None
+}
+
+// Deregisters a read transaction on `txn_id`, removing its slot when no
+// reader is left on it. The caller holds snapshot_mutex. The key is the
+// snapshot rather than a slot index, because indices shift on removal.
+@(private)
+reader_deregister :: proc(env: ^Env, txn_id: Txn_Id) {
+	i, found := slice.binary_search_by(env.readers[:], txn_id, proc(slot: Reader_Slot, key: Txn_Id) -> slice.Ordering {
+		return slice.cmp(slot.txn_id, key)
+	})
+	assert(found, "deregistering a reader that isn't registered")
+	env.readers[i].count -= 1
+	if env.readers[i].count == 0 {
+		ordered_remove(&env.readers, i)
+	}
 }
 
 // Writes `meta` to meta page `slot` (0 or 1), filling in the page header and
