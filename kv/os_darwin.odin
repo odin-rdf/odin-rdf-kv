@@ -53,3 +53,13 @@ os_evict :: proc(fd: posix.FD, addr: [^]byte, offset, size: int) -> Error {
 	}
 	return .None
 }
+
+// Would return the bytes of the range present in this process's page
+// tables, but macOS has no per-range source for that: mincore and
+// mach_vm_region both report the file's pages in the page cache, whether
+// the process maps them or not, and only the process-wide task_info
+// resident_size follows the mapping (measured in KV-T-0019). So it returns
+// Unsupported (KV-I-0004 D10).
+os_resident :: proc(addr: [^]byte, size: int) -> (resident: int, err: Error) {
+	return 0, .Unsupported
+}

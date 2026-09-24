@@ -50,3 +50,35 @@ os_evict :: proc(fd: posix.FD, addr: [^]byte, offset, size: int) -> Error {
 	}
 	return .None
 }
+
+/*
+Returns the bytes of the `size` bytes at `addr` (both multiples of the OS
+page size) that are present in this process's page tables: the pages whose
+/proc/self/pagemap entry has the present bit (bit 63), which unprivileged
+processes can read. Only the process's own mappings count, not the page
+cache: mincore reports the page cache, so it can't be used (measured in
+KV-T-0019). Reads the entries in batches into a buffer on the stack, 8
+bytes per page, so it allocates nothing. Returns Io if pagemap can't be
+read.
+*/
+os_resident :: proc(addr: [^]byte, size: int) -> (resident: int, err: Error) {
+	fd := posix.open("/proc/self/pagemap", {.CLOEXEC})
+	if fd == -1 {
+		return 0, .Io
+	}
+	defer posix.close(fd)
+	ps := os_page_size()
+	entries: [1024]u64
+	first, pages := int(uintptr(addr)) / ps, size / ps
+	for done := 0; done < pages; {
+		n := min(pages - done, len(entries))
+		os_pread(fd, ([^]byte)(&entries[0])[:n * size_of(u64)], i64(first + done) * size_of(u64)) or_return
+		for e in entries[:n] {
+			if e >> 63 != 0 {
+				resident += ps
+			}
+		}
+		done += n
+	}
+	return resident, .None
+}

@@ -46,7 +46,12 @@ The upstream C sources in `liblmdb/` are a reference for comparison. This design
 - KV-I-0003 (build step 4, delete with merge) is implemented (2026-09-24): `del` removes a key and its overflow run, merges an underfull page with a sibling when they fit (the sibling merges into the already-copied page, so a delete needs at most `depth` new pages), drops empty pages and collapses the root. There is no borrowing. The suite has 132 tests on macOS and Linux. Its Results section has the evidence:
   - **Page reuse under churn:** inserting and deleting over a moving key set keeps the file bounded (352 pages loaded, 368–373 after 10⁴ commits, none added in the second half).
   - **Fill after deletes:** about 40% after random deletes against 70% for an insert-only tree of the same keys, so 1.6–1.8× the leaves, but no leaf below 25% in the measurement.
-- The memory budget (step 6) and crash testing (step 7) remain. Step 6 is planned as KV-I-0004 (2026-09-24), shaped by the first deployment: about 250 processes per server, each embedding a store, with low, request-driven load. Its one departure from this document: **there is no sweeper thread**; the application calls `env_sweep` (for example after each request, and with a target of 0 to put an idle store to sleep), and a read past the hard watermark evicts inline. This section's design is amended when the initiative completes.
+- The memory budget (step 6) and crash testing (step 7) remain. Step 6 is planned as KV-I-0004 (2026-09-24), shaped by the first deployment: about 250 processes per server, each embedding a store, with low, request-driven load. Its one departure from this document: **there is no sweeper thread**; the application calls `env_sweep` (for example after each request, and with a target of 0 to put an idle store to sleep), and a read past the hard watermark evicts inline. This section's design is amended when the initiative completes. *(2026-09-24: done; see the next item.)*
+- KV-I-0004 (build step 6, the memory budget) is implemented (2026-09-24, awaiting the owner's review): a fixed dirty-page pool (default 4 MiB) that spills pages to their final places instead of growing, overflow values and the free-list run written straight to the file, a resident estimate of the map in chunks, eviction to `Options.mapped_budget`, and `env_resident_check`. The suite has 161 tests on macOS and Linux. Its Results section has the evidence, the measurements and the capacity-planning figures:
+  - **How the budget is kept (no sweeper thread):** the end of every transaction evicts down to 7/8 of the budget when the estimate is above it, and a read past the budget plus two chunks waits for any eviction under way and evicts inline. The application calls `env_sweep(env, 0)` only to put an idle store to sleep, after hours without a request: every mapped page leaves the process while the store stays open.
+  - **The success criterion holds** on macOS and Linux (arm64, amd64): with a 100 MB database, a 15 MiB mapped budget plus the 4 MiB pool, and mixed read, scan and write threads that never call `env_sweep`, the OS's resident figure plus the pool peaked at 7.2–10.0 MiB against a limit of 19.5 MiB. With 64 KiB chunks and an 8 MiB budget, it peaked at 7.3–12.0 MiB against 12.1 MiB.
+  - **Per store:** at most the budget plus two chunks plus the pool while in use, 0 dirty bytes between requests, about 40–70 KiB of heap asleep (plus 16 bytes per free-list record), nothing after `env_close`. A sleep takes 50–90 µs, and a wake by `env_open` 7 µs to 5 ms depending on the free list.
+  - Known limits: the mapped budget is soft (about one chunk more per concurrent thread), `env_resident_check` answers only on Linux (`.Unsupported` on macOS), and a tight cursor scan is about 9% slower for the accounting (accepted).
 - Toolchain: Odin `dev-2026-09`. The development platform is macOS (Darwin). Linux is also a target.
 
 ## Future State
@@ -105,13 +110,17 @@ A tested, crash-safe Odin library that:
   - **Self-accounting, not OS measurement:** divide the map into aligned chunks of at least 64 KiB (for example 256 KiB), each with two bits, `resident` and `referenced`. `page_ptr` sets `referenced` and switches `resident` on with a compare-and-swap, which increments `resident_chunks`.
   - **Eviction order:** clear the `resident` bit first, then evict the range. A racing reader can then only cause an overestimate, never an underestimate.
   - **Sweeper:** a background thread runs CLOCK at the soft watermark. At the hard watermark, the reader thread that crossed it evicts a few chunks itself.
+    *(Amended 2026-09-24, KV-I-0004: **there is no sweeper thread.** The store checks its budget at the end of every transaction and, above it, evicts by CLOCK down to 7/8 of it, without waiting if another thread is evicting. A read that takes the estimate past the budget plus two chunks evicts inline as a backstop, waiting for an eviction under way. The application calls `env_sweep(env, 0)` to put an idle store to sleep (every mapped page leaves the process, the store stays open, held slices stay valid). A thread per store would have been 250 threads per server in the first deployment.)*
   - **Eviction:** Linux uses `MADV_DONTNEED`, or `MADV_PAGEOUT` to also leave the page cache. macOS remaps the range over itself with `MAP_FIXED`, because `MADV_DONTNEED` is only a hint there. Eviction never affects correctness: addresses stay valid and pages are faulted back in.
+    *(Amended 2026-09-24, KV-I-0004: measured and built as written, except that `MADV_PAGEOUT` is not used, since dropping the shared page cache only slows later reads. Linux calls `madvise` itself, because glibc's `posix_madvise(POSIX_MADV_DONTNEED)` is a no-op. macOS gives `MADV_RANDOM` again after the remap. The map is reserved at a chunk-aligned address.)*
   - **Periodic check against the OS:** Linux uses `/proc/self/pagemap` present bits. It must not use `mincore`, which reports page-cache residency. macOS uses `mincore`, which errs toward overcounting (safe). Verify this empirically.
+    *(Amended 2026-09-24, KV-I-0004: the check is `env_resident_check`, **on demand, not periodic**, and it never corrects the estimate. Linux uses `pagemap` as planned. **On macOS it returns `.Unsupported`:** `mincore` and `mach_vm_region` both report the file's pages in the page cache (64 MiB for a mapping nothing had touched), and no per-range source follows the mapping. There the tests use the process's `task_info` figures instead. Measured drift: the OS never held more than the estimate on a consistent sample.)*
 - **Dirty pages (hard limit):**
   - A fixed pool of dirty-page buffers replaces a per-transaction arena. When it is full, *spill*: `pwrite` the least recently touched leaves to their final, not-yet-visible locations.
   - A page number allocated by the current transaction can be re-touched without copy-on-write.
   - Large values go straight from the caller's buffer to overflow pages with `pwrite`.
   - The pool's memory is committed on demand and released when the writer is idle.
+    *(Amended 2026-09-24, KV-I-0004: released at the end of every write transaction, with a call that drops it at once: `MADV_DONTNEED` on Linux, an anonymous `MAP_FIXED` remap on macOS. `MADV_FREE`, which `core:mem/virtual` uses, is lazy on both. Overflow values and the free-list run go straight to the file, so neither needs a pool its size. Spilling takes the least recently touched quarter of the pool, between operations only.)*
 - **Example 20 MB budget:**
 
   | Component | Budget |
@@ -120,6 +129,8 @@ A tested, crash-safe Odin library that:
   | Dirty-page pool | 4 MB |
   | Fixed structures | under 1 MB |
   | Headroom | the remainder |
+
+  *(Amended 2026-09-24, measured in KV-I-0004's criterion test with a 100 MB database: 15 MiB mapped and 4 MiB of pool held within 19.5 MiB, with fixed structures of 40–70 KiB. The per-store capacity table for the first deployment is in KV-I-0004's Results.)*
 
 - **Rejected alternatives:**
   - **Process-wide limit** (cgroup `memory.high`): would also constrain the host's other data sources.
@@ -139,11 +150,12 @@ A tested, crash-safe Odin library that:
   | Group | Operations |
   |---|---|
   | Environment | `env_open(path, map_size, mapped_budget, dirty_budget, chunk_size, …)`, `env_close`, `env_stats` |
+  | Memory *(added 2026-09-24, KV-I-0004)* | `env_sweep(env, target)` (target 0: the sleep path), `env_resident_check` (Linux; `.Unsupported` on macOS) |
   | Transactions | `txn_begin(env, read_only)`, `txn_commit`, `txn_abort` (a no-op after commit, so `defer txn_abort` is idiomatic) |
   | Data | `get`, `put`, `del` |
   | Cursors | `cursor_open` (returns a value), `cursor_first`, `cursor_last`, `cursor_seek`, `cursor_next`, `cursor_prev` |
 
-- **Errors:** an `Error` enum (`None`, `Not_Found`, `Map_Full`, `Key_Too_Large`, `Corrupted`, `Io`, `Txn_Read_Only`, `Locked`, `Invalid_Argument`, `Out_Of_Memory`) returned as multiple return values, which works with `or_return`.
+- **Errors:** an `Error` enum (`None`, `Not_Found`, `Map_Full`, `Key_Too_Large`, `Corrupted`, `Io`, `Txn_Read_Only`, `Locked`, `Invalid_Argument`, `Out_Of_Memory`) returned as multiple return values, which works with `or_return`. *(2026-09-24, KV-I-0004: `Unsupported` added, for a valid call the platform can't answer.)*
 - **Statistics:** `env_stats` reports the resident estimate, dirty pages, spills, evictions and fault rate, so the host can see the store's share of memory.
 
 ## Planned Build Order
@@ -155,6 +167,7 @@ A tested, crash-safe Odin library that:
 5. Free list and reader table for page reuse.
 6. Memory budget: dirty-page pool with spilling, chunk accounting, sweeper, and platform-specific eviction.
 7. Crash tests (kill the process during commit) and fuzzing against a `map[string]string` oracle.
+   *(Amended 2026-09-24, KV-I-0004: the crash tests also cover a process **killed after a spill, before commit**: pages spilled, and overflow runs or free-list pages written, before the meta page.)*
 
 ## Success Criteria
 
@@ -184,4 +197,4 @@ A tested, crash-safe Odin library that:
 - The memory budget for mapped pages is approximate (soft), and the address-space reservation (`map_size`) is fixed at open.
 - Long-lived read transactions prevent page reuse and make the file grow.
 - The host process's memory cannot be limited; the store can only limit its own.
-- Eviction behaviour on macOS (remapping with `MAP_FIXED`, `mincore` semantics) needs to be verified empirically on the development platform.
+- Eviction behaviour on macOS (remapping with `MAP_FIXED`, `mincore` semantics) needs to be verified empirically on the development platform. *(Verified 2026-09-24, KV-T-0019: the remap works and is safe under concurrent readers; `mincore` reports the page cache and can't check the estimate.)*

@@ -465,3 +465,36 @@ env_sweep :: proc(env: ^Env, target := -1) -> (evicted: int) {
 	}
 	return evicted
 }
+
+/*
+Asks the OS how much of the map is resident in this process (KV-I-0004
+D10), and returns it in bytes: the pages of the map, over the file's
+extent, present in the process's page tables. A statistic, and the check
+of the resident estimate (Stats.resident_chunks) against what the process
+really holds; it doesn't change the estimate (Q4).
+
+The two differ in both directions. The estimate counts whole chunks, while
+the OS counts pages, so a chunk read in one place counts a chunk here and
+a few pages there. And pages read through slices held across an eviction
+are faulted back in without being counted until a later read marks their
+chunk, so the OS can hold chunks the estimate doesn't (Q4).
+
+Linux reads /proc/self/pagemap: 8 bytes per page, about 0.1–0.2 ms for a
+100 MB file, allocating nothing. It never uses mincore, which reports the
+page cache: the file's pages cached for any process, mapped here or not.
+macOS has no per-range source that follows the mapping (KV-T-0019), so
+there it returns (0, Unsupported); the process-wide task_info
+resident_size is the only figure, and it includes everything else the
+host holds. Io if the OS can't be asked.
+
+Safe to call from any thread, at any time: it only reads the page tables,
+and takes snapshot_mutex briefly for the file's size.
+*/
+env_resident_check :: proc(env: ^Env) -> (resident_bytes: int, err: Error) {
+	sync.mutex_lock(&env.snapshot_mutex)
+	extent := env.stats.file_pages * env.page_size
+	sync.mutex_unlock(&env.snapshot_mutex)
+	ps := os_page_size()
+	extent = min((extent + ps - 1) / ps * ps, env.map_size)
+	return os_resident(env.map_base, extent)
+}

@@ -187,3 +187,17 @@ advice_random :: proc(base: [^]byte, size: int) -> (random: bool, ok: bool) {
 	}
 	return random && ok, ok
 }
+
+// The process's file-backed resident memory, RssFile in /proc/self/status:
+// the pages of mapped files, such as a store's map, and not the heap. The
+// counterpart of the macOS helper, which the macOS checks use (KV-T-0024);
+// on Linux env_resident_check answers for the map itself.
+process_file_resident :: proc() -> int {
+	status := read_proc("/proc/self/status")
+	for line in strings.split_lines_iterator(&status) {
+		if strings.has_prefix(line, "RssFile:") {
+			return kb_field(line)
+		}
+	}
+	return 0
+}

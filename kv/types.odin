@@ -33,6 +33,10 @@ Error :: enum u8 {
 	// couldn't be committed. (The pool's size never limits put or del:
 	// it spills instead.)
 	Out_Of_Memory,
+	// The call is valid, but this platform can't answer it:
+	// env_resident_check on macOS, which has no per-range source for the
+	// pages mapped into the process (KV-I-0004 D10).
+	Unsupported,
 }
 
 // "ODKV" when read as bytes from the start of the meta struct.

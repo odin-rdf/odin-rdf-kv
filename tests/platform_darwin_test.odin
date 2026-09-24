@@ -128,6 +128,14 @@ platform_residency :: proc(base: [^]byte, size: int) -> (r: Platform_Residency) 
 	return r
 }
 
+// The process's file-backed resident memory, task_info's `external`: the
+// pages of mapped files, such as a store's map, and not the heap. For the
+// memory-budget criterion (KV-T-0024), where the process-wide resident
+// size also carries whatever malloc keeps resident after a free.
+process_file_resident :: proc() -> int {
+	return int(task_vm_info().external)
+}
+
 // How long the platform's own sources take over the range.
 platform_source_costs :: proc(base: [^]byte, size: int) {
 	start := time.tick_now()
