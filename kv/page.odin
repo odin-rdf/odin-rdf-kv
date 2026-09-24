@@ -443,6 +443,74 @@ page_move_upper :: proc(src, dst: []byte, from_idx: int) {
 }
 
 // ---------------------------------------------------------------------------
+// Merge
+
+// Whether a page has dropped below a quarter of its usable space, the point
+// at which delete tries to merge it with a sibling (KV-I-0003 D4).
+page_underfull :: proc(page: []byte) -> bool {
+	return page_used(page) < (len(page) - PAGE_HEADER_SIZE) / 4
+}
+
+/*
+Whether pages `a` and `b`, of the same kind, fit in one page when merged. On
+branch pages the right-hand page's slot-0 node (−∞, with an empty key) gets
+the `sep_len`-byte separator from the parent, so it grows by that much.
+*/
+page_merge_fits :: proc(a, b: []byte, sep_len: int) -> bool {
+	extra := 0 if page_is_leaf(a) else sep_len
+	return page_used(a) + page_used(b) + extra <= len(a) - PAGE_HEADER_SIZE
+}
+
+/*
+Moves every node of `src` into `dst`, a page of the same kind, which ends up
+compacted: before dst's own nodes if `src_left`, after them otherwise. `src`
+is not modified; the caller frees it.
+
+On branch pages, the right-hand page's slot-0 node (−∞) takes `sep` as its
+key: the separator between the two pages in their parent. `sep` must not
+point into either page, nor into the parent if the parent is about to
+change. Leaf pages ignore it. The pages must fit (page_merge_fits).
+*/
+page_merge :: proc(dst, src: []byte, src_left: bool, sep: []byte) {
+	assert(len(dst) == len(src), "pages must be the same size")
+	assert(page_is_leaf(dst) == page_is_leaf(src), "pages must be of the same kind")
+	assert(page_merge_fits(dst, src, len(sep)), "merged pages do not fit")
+	leaf := page_is_leaf(dst)
+
+	scratch: Page_Scratch = ---
+	orig := scratch.bytes[:len(dst)]
+	copy(orig, dst)
+	h := page_header(dst)
+	page_init(dst, Pgno(h.pgno), u16(h.flags))
+
+	left, right := src, orig
+	if !src_left {
+		left, right = orig, src
+	}
+	for i in 0 ..< page_num_keys(left) {
+		node_append_raw(dst, node_bytes(left, i))
+	}
+	for i in 0 ..< page_num_keys(right) {
+		if !leaf && i == 0 {
+			ok := branch_insert(dst, page_num_keys(dst), sep, branch_child(right, 0))
+			assert(ok)
+			continue
+		}
+		node_append_raw(dst, node_bytes(right, i))
+	}
+}
+
+// Makes a branch page's slot 0 −∞ again after its first node was removed:
+// the new first node keeps its child and loses its key.
+branch_clear_first_key :: proc(page: []byte) {
+	assert(page_is_branch(page) && page_num_keys(page) > 0)
+	child := branch_child(page, 0)
+	node_remove(page, 0)
+	ok := branch_insert(page, 0, nil, child)
+	assert(ok)
+}
+
+// ---------------------------------------------------------------------------
 // Invariant checking
 
 /*

@@ -204,6 +204,27 @@ pages_available :: proc(txn: ^Txn, singles: int, run := 0) -> bool {
 }
 
 /*
+Drops the `count` pages starting at `pgno`, a single page or an overflow run,
+that the tree no longer uses. Pages of the snapshot are recorded as freed,
+for the free list to release once no reader can see them. Pages this
+transaction wrote (their buffer is in `dirty` under `pgno`) were never seen
+by anyone, so they are discarded and recorded as loose, for page_alloc to
+hand out again (KV-I-0003 D8).
+*/
+@(private)
+page_free :: proc(txn: ^Txn, pgno: Pgno, count := 1) {
+	w := txn.write
+	list := &w.freed
+	if pgno in w.dirty {
+		delete_key(&w.dirty, pgno)
+		list = &w.loose
+	}
+	for i in 0 ..< count {
+		append(list, pgno + Pgno(i))
+	}
+}
+
+/*
 Makes the page at `path` level `level` writable and returns it. A page this
 transaction already wrote is returned as is. Otherwise the committed page is
 copied to a new page number, the parent (already touched, as touching goes

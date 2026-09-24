@@ -87,13 +87,6 @@ run_header_check :: proc(first: []byte, pgno, last: Pgno, flags: u16, size: int,
 @(private)
 overflow_free :: proc(txn: ^Txn, pgno: Pgno, val_len: int) -> Error {
 	count := overflow_check(txn, pgno, val_len) or_return
-	list := &txn.write.freed
-	if pgno in txn.write.dirty {
-		delete_key(&txn.write.dirty, pgno)
-		list = &txn.write.loose
-	}
-	for i in 0 ..< count {
-		append(list, pgno + Pgno(i))
-	}
+	page_free(txn, pgno, count)
 	return .None
 }

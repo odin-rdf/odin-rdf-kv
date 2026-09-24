@@ -526,3 +526,204 @@ test_page_check_detects_corruption :: proc(t: ^testing.T) {
 	kv.branch_insert(page, 0, transmute([]byte)string("x"), 2)
 	expect_bad(t, page, "branch slot 0 with a key")
 }
+
+// The keys of a page as u32s, for pages built with be_key.
+page_u32_keys :: proc(page: []byte) -> [dynamic]u32 {
+	keys := make([dynamic]u32, context.temp_allocator)
+	for i in 0 ..< kv.page_num_keys(page) {
+		k := kv.node_key(page, i)
+		v, _ := endian.get_u32(k, .Big)
+		append(&keys, v if len(k) == 4 else max(u32))
+	}
+	return keys
+}
+
+@(test)
+test_page_merge_leaf :: proc(t: ^testing.T) {
+	left_buf, right_buf: Page_Buf
+	left, right := left_buf.bytes[:], right_buf.bytes[:]
+
+	fill :: proc(left, right: []byte) {
+		kv.page_init(left, 10, kv.PAGE_LEAF)
+		kv.page_init(right, 11, kv.PAGE_LEAF)
+		key: [4]byte
+		for i in 0 ..< 5 {
+			kv.leaf_insert(left, i, be_key(&key, u32(i)), {byte(i), byte(i)})
+		}
+		kv.leaf_insert_overflow(left, 5, be_key(&key, 5), 99, 5000)
+		for i in 6 ..< 10 {
+			kv.leaf_insert(right, i - 6, be_key(&key, u32(i)), {byte(i)})
+		}
+	}
+	expect_merged :: proc(t: ^testing.T, page: []byte, pgno: u64, loc := #caller_location) {
+		expect_page_ok(t, page, loc)
+		testing.expect_value(t, kv.page_header(page).pgno, u64le(pgno), loc = loc)
+		keys := page_u32_keys(page)
+		testing.expect_value(t, len(keys), 10, loc = loc)
+		for k, i in keys {
+			testing.expect_value(t, k, u32(i), loc = loc)
+			value, overflow, bigdata := kv.leaf_value(page, i)
+			if i == 5 {
+				testing.expect(t, bigdata && overflow == 99 && kv.leaf_value_size(page, i) == 5000, "overflow node", loc = loc)
+			} else {
+				testing.expect(t, !bigdata && len(value) > 0 && value[0] == byte(i), "value", loc = loc)
+			}
+		}
+	}
+
+	// A right sibling is appended; the source page is untouched.
+	fill(left, right)
+	before := right_buf
+	kv.page_merge(left, right, false, nil)
+	expect_merged(t, left, 10)
+	testing.expect(t, before.bytes == right_buf.bytes, "source page changed")
+
+	// A left sibling is prepended.
+	fill(left, right)
+	kv.page_merge(right, left, true, nil)
+	expect_merged(t, right, 11)
+
+	// Merging an empty page changes nothing but compaction.
+	fill(left, right)
+	kv.page_init(right, 11, kv.PAGE_LEAF)
+	kv.page_merge(left, right, false, nil)
+	testing.expect_value(t, kv.page_num_keys(left), 6)
+	expect_page_ok(t, left)
+}
+
+@(test)
+test_page_merge_branch :: proc(t: ^testing.T) {
+	left_buf, right_buf: Page_Buf
+	left, right := left_buf.bytes[:], right_buf.bytes[:]
+
+	fill :: proc(left, right: []byte) {
+		kv.page_init(left, 20, kv.PAGE_BRANCH)
+		kv.page_init(right, 21, kv.PAGE_BRANCH)
+		key: [4]byte
+		kv.branch_insert(left, 0, nil, 100)
+		kv.branch_insert(left, 1, be_key(&key, 2), 101)
+		kv.branch_insert(left, 2, be_key(&key, 4), 102)
+		kv.branch_insert(right, 0, nil, 200)
+		kv.branch_insert(right, 1, be_key(&key, 8), 201)
+	}
+	expect_merged :: proc(t: ^testing.T, page: []byte, loc := #caller_location) {
+		expect_page_ok(t, page, loc)
+		want_keys := []u32{max(u32), 2, 4, 6, 8}
+		want_children := []kv.Pgno{100, 101, 102, 200, 201}
+		keys := page_u32_keys(page)
+		testing.expect_value(t, len(keys), len(want_keys), loc = loc)
+		for i in 0 ..< min(len(keys), len(want_keys)) {
+			testing.expect_value(t, keys[i], want_keys[i], loc = loc)
+			testing.expect_value(t, kv.branch_child(page, i), want_children[i], loc = loc)
+		}
+	}
+
+	sep_buf: [4]byte
+	sep := be_key(&sep_buf, 6)
+	fill(left, right)
+	kv.page_merge(left, right, false, sep)
+	expect_merged(t, left)
+	testing.expect_value(t, kv.page_header(left).pgno, 20)
+
+	fill(left, right)
+	kv.page_merge(right, left, true, sep)
+	expect_merged(t, right)
+	testing.expect_value(t, kv.page_header(right).pgno, 21)
+}
+
+@(test)
+test_branch_clear_first_key :: proc(t: ^testing.T) {
+	buf: Page_Buf
+	page := buf.bytes[:]
+	kv.page_init(page, 30, kv.PAGE_BRANCH)
+	key: [4]byte
+	kv.branch_insert(page, 0, nil, 100)
+	kv.branch_insert(page, 1, be_key(&key, 5), 101)
+	kv.branch_insert(page, 2, be_key(&key, 9), 102)
+
+	kv.node_remove(page, 0)
+	ok, _ := kv.page_check(page)
+	testing.expect(t, !ok, "a first node with a key should fail page_check")
+
+	kv.branch_clear_first_key(page)
+	expect_page_ok(t, page)
+	testing.expect_value(t, kv.page_num_keys(page), 2)
+	testing.expect_value(t, len(kv.node_key(page, 0)), 0)
+	testing.expect_value(t, kv.branch_child(page, 0), 101)
+	testing.expect_value(t, kv.branch_child(page, 1), 102)
+	testing.expect_value(t, page_u32_keys(page)[1], 9)
+}
+
+@(test)
+test_page_merge_fits_boundary :: proc(t: ^testing.T) {
+	a_buf, b_buf: Page_Buf
+	a, b := a_buf.bytes[:], b_buf.bytes[:]
+	key: [4]byte
+	value: [kv.DEFAULT_PAGE_SIZE]byte
+
+	// Leaves filling exactly one page between them: three of the largest
+	// inline nodes, a small one, and one node taking what is left.
+	build :: proc(a, b: []byte, small_val: int) {
+		key: [4]byte
+		value: [kv.DEFAULT_PAGE_SIZE]byte
+		threshold := kv.overflow_threshold(kv.DEFAULT_PAGE_SIZE)
+		kv.page_init(a, 1, kv.PAGE_LEAF)
+		kv.page_init(b, 2, kv.PAGE_LEAF)
+		kv.leaf_insert(a, 0, be_key(&key, 0), value[:small_val])
+		for i in 0 ..< 3 {
+			kv.leaf_insert(b, i, be_key(&key, u32(1 + i)), value[:threshold - kv.leaf_node_size(4, 0, false)])
+		}
+		rest := USABLE - kv.page_used(a) - kv.page_used(b) - kv.SLOT_SIZE - kv.leaf_node_size(4, 0, false)
+		kv.leaf_insert(b, 3, be_key(&key, 4), value[:rest])
+	}
+	build(a, b, 1)
+	testing.expect_value(t, kv.page_used(a) + kv.page_used(b), USABLE)
+	testing.expect(t, kv.page_merge_fits(a, b, 0), "exactly one page should fit")
+	testing.expect(t, kv.page_merge_fits(a, b, 100), "a leaf merge brings no separator down")
+	kv.page_merge(a, b, false, nil)
+	expect_page_ok(t, a)
+	testing.expect_value(t, kv.page_free_space(a), 0)
+	testing.expect_value(t, kv.page_num_keys(a), 5)
+
+	build(a, b, 1)
+	kv.page_init(a, 1, kv.PAGE_LEAF)
+	kv.leaf_insert(a, 0, be_key(&key, 0), value[:2])
+	testing.expect(t, !kv.page_merge_fits(a, b, 0), "one byte over should not fit")
+
+	// Branches: the separator counts.
+	kv.page_init(a, 1, kv.PAGE_BRANCH)
+	kv.page_init(b, 2, kv.PAGE_BRANCH)
+	kv.branch_insert(a, 0, nil, 10)
+	kv.branch_insert(b, 0, nil, 20)
+	long_key: [900]byte
+	for i in 1 ..< 4 {
+		long_key[0] = byte(i)
+		kv.branch_insert(b, i, long_key[:], kv.Pgno(20 + i))
+	}
+	gap := USABLE - kv.page_used(a) - kv.page_used(b)
+	testing.expect(t, kv.page_merge_fits(a, b, gap), "separator filling the gap should fit")
+	testing.expect(t, !kv.page_merge_fits(a, b, gap + 1), "separator one byte longer should not fit")
+}
+
+@(test)
+test_page_underfull :: proc(t: ^testing.T) {
+	buf: Page_Buf
+	page := buf.bytes[:]
+	key: [1]byte
+	value: [kv.DEFAULT_PAGE_SIZE]byte
+	quarter := USABLE / 4
+
+	kv.page_init(page, 1, kv.PAGE_LEAF)
+	testing.expect(t, kv.page_underfull(page), "an empty page is underfull")
+
+	// One node whose size plus slot is a quarter of the page, less one byte.
+	below := quarter - kv.SLOT_SIZE - kv.leaf_node_size(1, 0, false) - 1
+	kv.leaf_insert(page, 0, key[:], value[:below])
+	testing.expect_value(t, kv.page_used(page), quarter - 1)
+	testing.expect(t, kv.page_underfull(page), "one byte under a quarter")
+
+	kv.page_init(page, 1, kv.PAGE_LEAF)
+	kv.leaf_insert(page, 0, key[:], value[:below + 1])
+	testing.expect_value(t, kv.page_used(page), quarter)
+	testing.expect(t, !kv.page_underfull(page), "exactly a quarter")
+}

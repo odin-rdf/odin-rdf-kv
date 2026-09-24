@@ -49,12 +49,12 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 | File | Contents |
 |---|---|
 | `types.odin` | `Pgno`, `Txn_Id`, `Error`, format constants |
-| `page.odin` | On-disk page and node layout, size limits, slotted-page operations, split helpers, `page_check` |
+| `page.odin` | On-disk page and node layout, size limits, slotted-page operations, split and merge helpers, `page_check` |
 | `meta.odin` | Meta page layout and checksum |
 | `env.odin` | Open and close, choosing the meta page, `meta_write`, the reader table, `env_stats` |
 | `txn.odin` | `Txn` (a value type), `Write_State` (on the heap), the reuse horizon, `page_ptr` |
 | `tree.odin` | `tree_search`, `get` |
-| `write.odin` | `page_alloc` (loose, then reusable, then the end of the file), `pages_available`, `page_touch`, `put`, splits |
+| `write.odin` | `page_alloc` (loose, then reusable, then the end of the file), `pages_available`, `page_free`, `page_touch`, `put`, splits |
 | `freelist.odin` | Free-list records and run layout, load and validate at open, release at `txn_begin`, build and place at commit |
 | `overflow.odin` | Overflow value runs |
 | `commit.odin` | `txn_commit`, file growth |
