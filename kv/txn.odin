@@ -44,12 +44,12 @@ Write_State :: struct {
 	// Pages written by this transaction, by page number. An overflow run is
 	// stored as one buffer under its first page number.
 	dirty: map[Pgno][]byte,
-	// Pages of the snapshot that this transaction replaced. Page reuse
-	// (step 5) will put them on the free list at commit.
+	// Pages of the snapshot that this transaction replaced. The commit puts
+	// them on the free list, tagged with its own txn_id.
 	freed: [dynamic]Pgno,
 	// Pages this transaction allocated and then dropped again (a replaced
-	// overflow run). No reader ever saw them, so step 5 can reuse them
-	// immediately.
+	// overflow run). No reader ever saw them, so the commit puts them on the
+	// free list as reusable.
 	loose: [dynamic]Pgno,
 }
 

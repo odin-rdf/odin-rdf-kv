@@ -1,5 +1,6 @@
 package kv
 
+import "base:runtime"
 import "core:bytes"
 
 /*
@@ -13,7 +14,112 @@ Meant for tests and debug builds; it allocates a set of visited pages with
 `allocator`.
 */
 tree_check :: proc(txn: ^Txn, allocator := context.temp_allocator) -> (ok: bool, reason: string) {
+	c := checker_make(txn, allocator)
+	defer delete(c.visited, allocator)
+	return tree_walk(&c)
+}
+
+/*
+Checks that every page in [2, last_pgno] visible to `txn` has exactly one
+owner: the tree (its pages and overflow runs, walked as by tree_check), the
+free-list run, or a free-list record. In a write transaction, the pages it
+has freed or dropped (`freed` and `loose`) are owners too; the free list is
+the one the transaction began from. Pages 0 and 1 are the meta pages.
+
+This is the check that catches a leaked page or one owned twice. Meant for
+tests; it allocates a bit per page with `allocator`.
+*/
+space_check :: proc(txn: ^Txn, allocator := context.temp_allocator) -> (ok: bool, reason: string) {
+	c := checker_make(txn, allocator)
+	defer delete(c.visited, allocator)
+	if walk_ok, walk_reason := tree_walk(&c); !walk_ok {
+		return false, walk_reason
+	}
+
 	snap := txn.snapshot
+	if snap.freelist_pgno != 0 || snap.freelist_count != 0 {
+		records, pages, run_ok := freelist_run(txn.env.map_base, txn.env.page_size, snap)
+		if !run_ok {
+			return false, "bad free-list run"
+		}
+		for i in 0 ..< pages {
+			if mark_ok, mark_reason := mark_free(&c, snap.freelist_pgno + Pgno(i)); !mark_ok {
+				return false, mark_reason
+			}
+		}
+		for r in records {
+			if mark_ok, mark_reason := mark_free(&c, Pgno(r.pgno)); !mark_ok {
+				return false, mark_reason
+			}
+		}
+	}
+	if txn.write != nil {
+		for pgno in txn.write.freed {
+			if mark_ok, mark_reason := mark_free(&c, pgno); !mark_ok {
+				return false, mark_reason
+			}
+		}
+		for pgno in txn.write.loose {
+			if mark_ok, mark_reason := mark_free(&c, pgno); !mark_ok {
+				return false, mark_reason
+			}
+		}
+	}
+	if c.marked != int(snap.last_pgno) - 1 {
+		return false, "page owned by nothing"
+	}
+	return true, ""
+}
+
+@(private = "file")
+Tree_Checker :: struct {
+	txn:     ^Txn,
+	depth:   int,
+	// One bit per page number up to the snapshot's last_pgno.
+	visited: []u64,
+	// Number of bits set in `visited`.
+	marked:  int,
+	entries: u64,
+}
+
+@(private = "file")
+checker_make :: proc(txn: ^Txn, allocator: runtime.Allocator) -> Tree_Checker {
+	return Tree_Checker {
+		txn     = txn,
+		depth   = int(txn.snapshot.depth),
+		visited = make([]u64, int(txn.snapshot.last_pgno) / 64 + 1, allocator),
+	}
+}
+
+// Marks `pgno`, which must be in range, as visited. Returns false if it
+// already was.
+@(private = "file")
+visit :: proc(c: ^Tree_Checker, pgno: Pgno) -> bool {
+	word, bit := &c.visited[pgno / 64], u64(1) << (pgno % 64)
+	if word^ & bit != 0 {
+		return false
+	}
+	word^ |= bit
+	c.marked += 1
+	return true
+}
+
+// Marks a page owned by the free list or the write transaction.
+@(private = "file")
+mark_free :: proc(c: ^Tree_Checker, pgno: Pgno) -> (ok: bool, reason: string) {
+	if pgno < 2 || pgno > c.txn.snapshot.last_pgno {
+		return false, "free page out of range"
+	}
+	if !visit(c, pgno) {
+		return false, "page owned twice"
+	}
+	return true, ""
+}
+
+// The walk behind tree_check, marking every page it reaches.
+@(private = "file")
+tree_walk :: proc(c: ^Tree_Checker) -> (ok: bool, reason: string) {
+	snap := c.txn.snapshot
 	if snap.root == 0 {
 		if snap.depth != 0 || snap.entries != 0 {
 			return false, "empty tree with non-zero depth or entries"
@@ -23,29 +129,13 @@ tree_check :: proc(txn: ^Txn, allocator := context.temp_allocator) -> (ok: bool,
 	if snap.depth == 0 || int(snap.depth) > MAX_DEPTH {
 		return false, "bad depth"
 	}
-
-	c := Tree_Checker {
-		txn     = txn,
-		depth   = int(snap.depth),
-		visited = make(map[Pgno]struct{}, allocator),
-	}
-	defer delete(c.visited)
-
-	if sub_ok, sub_reason := check_subtree(&c, snap.root, 1, {}); !sub_ok {
+	if sub_ok, sub_reason := check_subtree(c, snap.root, 1, {}); !sub_ok {
 		return false, sub_reason
 	}
 	if c.entries != snap.entries {
 		return false, "entry count does not match the snapshot"
 	}
 	return true, ""
-}
-
-@(private = "file")
-Tree_Checker :: struct {
-	txn:     ^Txn,
-	depth:   int,
-	visited: map[Pgno]struct{},
-	entries: u64,
 }
 
 // Bounds on the keys of a subtree: lo ≤ key < hi, each only if present.
@@ -77,11 +167,9 @@ check_overflow :: proc(c: ^Tree_Checker, pgno: Pgno, key_len, val_len: int) -> (
 		return false, "overflow run for a value that fits inline"
 	}
 	for i in 0 ..< count {
-		p := pgno + Pgno(i)
-		if p in c.visited {
+		if !visit(c, pgno + Pgno(i)) {
 			return false, "overflow page reachable more than once"
 		}
-		c.visited[p] = {}
 	}
 	return true, ""
 }
@@ -91,10 +179,9 @@ check_subtree :: proc(c: ^Tree_Checker, pgno: Pgno, level: int, r: Key_Range) ->
 	if pgno < 2 || pgno > c.txn.snapshot.last_pgno {
 		return false, "page number out of range"
 	}
-	if pgno in c.visited {
+	if !visit(c, pgno) {
 		return false, "page reachable more than once"
 	}
-	c.visited[pgno] = {}
 
 	page := page_ptr(c.txn, pgno)
 	if page_ok, page_reason := page_check(page); !page_ok {

@@ -24,7 +24,8 @@ Meta :: struct {
 	// Highest page number in use.
 	last_pgno: u64le,
 
-	// Free-list location. Reserved for page reuse and written as 0 until then.
+	// First page of the free-list run and the number of records in it, or
+	// both 0 for an empty free list (see freelist.odin).
 	freelist_pgno:  u64le,
 	freelist_count: u64le,
 

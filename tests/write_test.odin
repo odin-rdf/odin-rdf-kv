@@ -32,6 +32,12 @@ expect_tree_ok :: proc(t: ^testing.T, txn: ^kv.Txn, loc := #caller_location) -> 
 	return ok
 }
 
+expect_space_ok :: proc(t: ^testing.T, txn: ^kv.Txn, loc := #caller_location) -> bool {
+	ok, reason := kv.space_check(txn)
+	testing.expectf(t, ok, "space_check failed: %s", reason, loc = loc)
+	return ok
+}
+
 @(test)
 test_put_first_key_creates_root_leaf :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)

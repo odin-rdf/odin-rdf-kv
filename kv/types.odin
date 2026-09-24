@@ -48,6 +48,8 @@ PAGE_BRANCH   :: 0x01
 PAGE_LEAF     :: 0x02
 PAGE_OVERFLOW :: 0x04
 PAGE_META     :: 0x08
+// The first page of the free-list run (see freelist.odin).
+PAGE_FREELIST :: 0x10
 
 // Leaf_Node_Header.flags: the value lives in an overflow run and the node
 // stores its first page number instead of the value bytes.

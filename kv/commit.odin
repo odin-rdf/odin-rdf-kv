@@ -13,17 +13,20 @@ Makes the transaction's changes durable and visible to new transactions,
 then ends it. The steps are ordered so that a crash at any point leaves the
 previous commit intact:
 
-1. Grow the file if needed and write every dirty page. These are all new
-   pages that no committed meta page refers to yet.
-2. Sync, so the pages are on disk before anything points at them.
-3. Write the meta page for txn_id + 1 into the slot the previous commit
+1. Build the new free list and allocate a run for it (see freelist.odin).
+2. Grow the file if needed and write every dirty page, the run included.
+   These are all new pages that no committed meta page refers to yet.
+3. Sync, so the pages are on disk before anything points at them.
+4. Write the meta page for txn_id + 1 into the slot the previous commit
    didn't use, then sync it.
-4. Publish the new snapshot to transactions that begin from now on.
+5. Publish the new snapshot to transactions that begin from now on, and
+   replace the env's free list.
 
 On failure the transaction is aborted and the error returned; the database
-stays at the previous commit. If only the final sync fails, the new meta
-page may or may not have reached the disk: the next open sees whichever
-state is durable, and this process keeps the previous one.
+and the env's free list stay at the previous commit. If only the final sync
+fails, the new meta page may or may not have reached the disk: the next
+open sees whichever state is durable, and this process keeps the previous
+one.
 
 Committing a read-only transaction, or a write transaction that changed
 nothing, just ends it. Committing a transaction that failed part-way returns
@@ -49,6 +52,23 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 	snap := &txn.snapshot
 	ps := i64(env.page_size)
 
+	// The free list is built outside Env.free, which only changes once the
+	// commit is durable. Its run is allocated last, so nothing it lists can
+	// change after it is written.
+	next := freelist_build(txn) or_return
+	defer if err != .None {
+		free_state_destroy(&next)
+	}
+	count := free_state_count(next)
+	run: Pgno
+	if count > 0 {
+		pages := freelist_run_pages(env.page_size, count)
+		buf: []byte
+		run, buf = page_alloc(txn, pages) or_return
+		freelist_write(buf, run, pages, next)
+	}
+	snap.freelist_pgno, snap.freelist_count = run, u64(count)
+
 	file_grow(env, (i64(snap.last_pgno) + 1) * ps) or_return
 
 	// Write in page order: cheap to do, and it gives the OS sequential I/O.
@@ -66,14 +86,16 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 
 	snap.txn_id += 1
 	meta := Meta {
-		magic     = MAGIC,
-		version   = VERSION,
-		page_size = u32le(env.page_size),
-		txn_id    = u64le(snap.txn_id),
-		root      = u64le(snap.root),
-		depth     = u32le(snap.depth),
-		entries   = u64le(snap.entries),
-		last_pgno = u64le(snap.last_pgno),
+		magic          = MAGIC,
+		version        = VERSION,
+		page_size      = u32le(env.page_size),
+		txn_id         = u64le(snap.txn_id),
+		root           = u64le(snap.root),
+		depth          = u32le(snap.depth),
+		entries        = u64le(snap.entries),
+		last_pgno      = u64le(snap.last_pgno),
+		freelist_pgno  = u64le(snap.freelist_pgno),
+		freelist_count = u64le(snap.freelist_count),
 	}
 	meta_write(env, int(snap.txn_id & 1), meta) or_return
 	os_sync(env.fd) or_return
@@ -81,6 +103,9 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 	sync.mutex_lock(&env.snapshot_mutex)
 	env.snapshot = snap^
 	sync.mutex_unlock(&env.snapshot_mutex)
+	// Still under writer_mutex, which the transaction holds until it ends.
+	free_state_destroy(&env.free)
+	env.free = next
 	return .None
 }
 

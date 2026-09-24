@@ -25,11 +25,14 @@ Options :: struct {
 
 // The committed state that a transaction starts from.
 Snapshot :: struct {
-	txn_id:    Txn_Id,
-	root:      Pgno,
-	depth:     u32,
-	last_pgno: Pgno,
-	entries:   u64,
+	txn_id:         Txn_Id,
+	root:           Pgno,
+	depth:          u32,
+	last_pgno:      Pgno,
+	entries:        u64,
+	// The free-list run and its number of records, or 0 and 0.
+	freelist_pgno:  Pgno,
+	freelist_count: u64,
 }
 
 // Initial capacity of the reader table. Readers mostly share the latest
@@ -59,6 +62,9 @@ Env :: struct {
 	readers:        [dynamic]Reader_Slot,
 	// Held for the whole lifetime of a write transaction.
 	writer_mutex:   sync.Mutex,
+	// The free list of the last commit. Owned by the writer: only used with
+	// writer_mutex held, and replaced by a commit once it is durable.
+	free:           Free_State,
 	// Number of transactions not yet ended, updated atomically. Checked by
 	// env_close in debug builds.
 	active_txns:    int,
@@ -97,6 +103,11 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 	if !found {
 		return nil, .Corrupted
 	}
+	snapshot := snapshot_from_meta(meta)
+	free_state := freelist_load(base, meta_page_size, snapshot, allocator) or_return
+	defer if err != .None {
+		free_state_destroy(&free_state)
+	}
 
 	readers, readers_err := make([dynamic]Reader_Slot, 0, READER_TABLE_CAPACITY, allocator)
 	if readers_err != nil {
@@ -113,8 +124,9 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 		map_size  = map_size,
 		page_size = meta_page_size,
 		file_size = file_size,
-		snapshot  = snapshot_from_meta(meta),
+		snapshot  = snapshot,
 		readers   = readers,
+		free      = free_state,
 		allocator = allocator,
 	}
 	return env, .None
@@ -130,6 +142,7 @@ env_close :: proc(env: ^Env) {
 	os_unmap(env.map_base, env.map_size)
 	os_close(env.fd)
 	delete(env.readers)
+	free_state_destroy(&env.free)
 	free(env, env.allocator)
 }
 
@@ -297,16 +310,30 @@ meta_read :: proc(file: []byte, slot: int, page_size: int) -> (meta: Meta, ok: b
 	if meta.last_pgno < 1 || meta.root > meta.last_pgno || (meta.root == 0) != (meta.depth == 0) {
 		return {}, false
 	}
+	// The free-list run too. Bounding the count by the file first keeps the
+	// size computation from overflowing; the list itself is checked when it
+	// is loaded.
+	if meta.freelist_pgno != 0 {
+		if meta.freelist_pgno < 2 || u64(meta.freelist_count) > u64(len(file) / size_of(Free_Record)) {
+			return {}, false
+		}
+		run_pages := freelist_run_pages(size, int(meta.freelist_count))
+		if u64(meta.freelist_pgno) + u64(run_pages) - 1 > u64(meta.last_pgno) {
+			return {}, false
+		}
+	}
 	return meta, true
 }
 
 @(private = "file")
 snapshot_from_meta :: proc(meta: Meta) -> Snapshot {
 	return Snapshot {
-		txn_id    = Txn_Id(meta.txn_id),
-		root      = Pgno(meta.root),
-		depth     = u32(meta.depth),
-		last_pgno = Pgno(meta.last_pgno),
-		entries   = u64(meta.entries),
+		txn_id         = Txn_Id(meta.txn_id),
+		root           = Pgno(meta.root),
+		depth          = u32(meta.depth),
+		last_pgno      = Pgno(meta.last_pgno),
+		entries        = u64(meta.entries),
+		freelist_pgno  = Pgno(meta.freelist_pgno),
+		freelist_count = u64(meta.freelist_count),
 	}
 }

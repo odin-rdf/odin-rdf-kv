@@ -13,7 +13,8 @@ Model_Stats :: struct {
 
 /*
 Runs `ops` random operations against the database at `path` and the model,
-comparing after every commit and reopen. Stops early (returning true) when
+comparing after every commit and reopen, and checking with space_check that
+every page is owned exactly once before and after every commit. Stops early (returning true) when
 `stop_on_map_full` is set and a put hits Map_Full, after aborting, reopening
 and checking that the database is still at the last commit.
 
@@ -52,16 +53,6 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 	last_reopen := 0
 	version: u32
 
-	verify_committed :: proc(t: ^testing.T, env: ^kv.Env, ks: Key_Space, m: Model, buf: []byte, phase: string, seed: u64) -> bool {
-		reader, err := kv.txn_begin(env)
-		if err != .None {
-			testing.expectf(t, false, "[seed %d] %s: txn_begin: %v", seed, phase, err)
-			return false
-		}
-		defer kv.txn_abort(&reader)
-		return model_compare(t, &reader, ks, m, buf, phase, seed)
-	}
-
 	for op in 0 ..< ops {
 		if !in_txn {
 			txn, err = kv.txn_begin(env, read_only = false)
@@ -93,17 +84,8 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			spec := Val_Spec{true, version, size}
 			put_err := kv.put(&txn, key, model_value(id, spec, value_buf))
 			if put_err == .Map_Full && stop_on_map_full {
-				// Abort, reopen, and check the last commit is intact.
 				kv.txn_abort(&txn)
-				kv.env_close(env)
-				env, err = kv.env_open(path, options)
-				testing.expect_value(t, err, kv.Error.None)
-				if err != .None {
-					env = nil
-					return
-				}
-				verify_committed(t, env, ks, committed, value_buf, "after Map_Full and reopen", seed)
-				return stats, true
+				return stats, map_full_reopen(t, &env, path, options, ks, committed, value_buf, seed)
 			}
 			if put_err != .None {
 				testing.expectf(t, false, "[seed %d] op %d: put: %v", seed, op, put_err)
@@ -158,8 +140,19 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 		if txn_ops < txn_limit && op < ops - 1 {
 			continue
 		}
+		// Every page is accounted for in the write transaction too, with
+		// the pages it freed or dropped.
+		if ok, reason := kv.space_check(&txn, context.allocator); !ok {
+			testing.expectf(t, false, "[seed %d] op %d: space_check before commit: %s", seed, op, reason)
+			return
+		}
 		if rand.int_max(100) < 85 || op == ops - 1 {
-			if commit_err := kv.txn_commit(&txn); commit_err != .None {
+			commit_err := kv.txn_commit(&txn)
+			if commit_err == .Map_Full && stop_on_map_full {
+				// The commit's free-list run didn't fit (KV-I-0002 D6).
+				return stats, map_full_reopen(t, &env, path, options, ks, committed, value_buf, seed)
+			}
+			if commit_err != .None {
 				testing.expectf(t, false, "[seed %d] op %d: commit: %v", seed, op, commit_err)
 				return
 			}
@@ -190,6 +183,42 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 		}
 	}
 	return stats, false
+}
+
+// Checks the last commit with a new read transaction: model_compare, then
+// space_check.
+@(private = "file")
+verify_committed :: proc(t: ^testing.T, env: ^kv.Env, ks: Key_Space, m: Model, buf: []byte, phase: string, seed: u64) -> bool {
+	reader, err := kv.txn_begin(env)
+	if err != .None {
+		testing.expectf(t, false, "[seed %d] %s: txn_begin: %v", seed, phase, err)
+		return false
+	}
+	defer kv.txn_abort(&reader)
+	if !model_compare(t, &reader, ks, m, buf, phase, seed) {
+		return false
+	}
+	if ok, reason := kv.space_check(&reader, context.allocator); !ok {
+		testing.expectf(t, false, "[seed %d] %s: space_check: %s", seed, phase, reason)
+		return false
+	}
+	return true
+}
+
+// After a Map_Full with stop_on_map_full: reopens the database and checks
+// that it is still at the last commit. The transaction has already ended.
+@(private = "file")
+map_full_reopen :: proc(t: ^testing.T, env: ^^kv.Env, path: string, options: kv.Options, ks: Key_Space, committed: Model, buf: []byte, seed: u64) -> bool {
+	kv.env_close(env^)
+	err: kv.Error
+	env^, err = kv.env_open(path, options)
+	testing.expect_value(t, err, kv.Error.None)
+	if err != .None {
+		env^ = nil
+		return false
+	}
+	verify_committed(t, env^, ks, committed, buf, "after Map_Full and reopen", seed)
+	return true
 }
 
 @(test)

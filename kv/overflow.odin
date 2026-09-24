@@ -57,16 +57,26 @@ overflow_check :: proc(txn: ^Txn, pgno: Pgno, val_len: int) -> (count: int, err:
 	if pgno < 2 || pgno > last {
 		return 0, .Corrupted
 	}
-	h := page_header(page_ptr(txn, pgno))
-	if Pgno(h.pgno) != pgno || u16(h.flags) != PAGE_OVERFLOW {
-		return 0, .Corrupted
+	ok: bool
+	count, ok = run_header_check(page_ptr(txn, pgno), pgno, last, PAGE_OVERFLOW, val_len)
+	return count, .None if ok else .Corrupted
+}
+
+// Checks the header on `first`, the first page of a run at `pgno` holding
+// `size` bytes after its header: it records its own page number and exactly
+// `flags`, and has exactly the pages `size` needs, all within `last`. Returns
+// the run's length in pages. Shared by overflow runs and the free-list run.
+@(private)
+run_header_check :: proc(first: []byte, pgno, last: Pgno, flags: u16, size: int) -> (count: int, ok: bool) {
+	h := page_header(first)
+	if Pgno(h.pgno) != pgno || u16(h.flags) != flags {
+		return 0, false
 	}
 	count = int(h.overflow_count)
-	// The run must end inside the snapshot, and be exactly the right size.
-	if count != overflow_pages(txn.env.page_size, val_len) || int(pgno) + count - 1 > int(last) {
-		return 0, .Corrupted
+	if count != overflow_pages(len(first), size) || int(pgno) + count - 1 > int(last) {
+		return 0, false
 	}
-	return count, .None
+	return count, true
 }
 
 // Drops the overflow run at `pgno` whose value is being replaced or removed.

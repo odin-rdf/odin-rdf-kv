@@ -82,6 +82,7 @@ test_commit_and_reopen :: proc(t: ^testing.T) {
 	p := uintptr(raw_data(got))
 	testing.expect(t, p >= uintptr(env.map_base) && p + uintptr(len(got)) <= uintptr(env.map_base) + uintptr(env.map_size), "overflow value not in the map")
 	testing.expect(t, expect_tree_ok(t, &txn), "tree invalid after reopen")
+	expect_space_ok(t, &txn)
 }
 
 @(test)
@@ -100,6 +101,12 @@ test_commits_alternate_meta_pages :: proc(t: ^testing.T) {
 		key: [8]byte
 		kv.put(&txn, u64_key(&key, u64(i)), transmute([]byte)fmt.tprintf("%d", i))
 		testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
+		reader, _ := kv.txn_begin(env)
+		space_ok := expect_space_ok(t, &reader)
+		kv.txn_abort(&reader)
+		if !space_ok {
+			break
+		}
 
 		// Commit i went to slot i & 1; the other slot holds commit i - 1.
 		newer, newer_ok := read_meta(t, env, i & 1)
@@ -153,6 +160,7 @@ test_commit_falls_back_when_newest_meta_damaged :: proc(t: ^testing.T) {
 	testing.expect_value(t, txn.snapshot.entries, 500)
 	expect_even_entries(t, &txn, 500)
 	expect_tree_ok(t, &txn)
+	expect_space_ok(t, &txn)
 }
 
 @(test)
@@ -199,6 +207,7 @@ test_commit_map_full_then_abort :: proc(t: ^testing.T) {
 	value_after, get_err := kv.get(&reader, transmute([]byte)string("after"))
 	testing.expect(t, get_err == .None && string(value_after) == "full", "last commit lost")
 	testing.expect_value(t, reader.snapshot.entries, 201)
+	expect_space_ok(t, &reader)
 }
 
 @(test)
@@ -298,6 +307,7 @@ test_commit_io_error_rolls_back :: proc(t: ^testing.T) {
 	defer kv.txn_abort(&reader)
 	testing.expect_value(t, reader.snapshot.txn_id, before.txn_id)
 	expect_even_entries(t, &reader, 100)
+	expect_space_ok(t, &reader)
 }
 
 @(test)
@@ -358,6 +368,7 @@ test_commit_replaces_committed_overflow :: proc(t: ^testing.T) {
 		testing.expect(t, slice.contains(txn.write.freed[:], run + kv.Pgno(p)), "committed run page not freed")
 	}
 	testing.expect_value(t, len(txn.write.loose), 0)
+	expect_space_ok(t, &txn)
 	testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
 
 	reader, _ := kv.txn_begin(env)
@@ -365,6 +376,7 @@ test_commit_replaces_committed_overflow :: proc(t: ^testing.T) {
 	got, get_err := kv.get(&reader, key)
 	testing.expect(t, get_err == .None && string(got) == "small now", "overwrite lost")
 	expect_tree_ok(t, &reader)
+	expect_space_ok(t, &reader)
 }
 
 @(test)
@@ -394,6 +406,7 @@ test_commit_snapshot_isolation :: proc(t: ^testing.T) {
 	// The reader that began before the commit still sees the old state...
 	expect_even_entries(t, &old_reader, 1_000)
 	testing.expect_value(t, old_reader.snapshot.entries, 1_000)
+	expect_space_ok(t, &old_reader)
 
 	// ...and a new one sees the new state.
 	new_reader, _ := kv.txn_begin(env)
@@ -403,4 +416,5 @@ test_commit_snapshot_isolation :: proc(t: ^testing.T) {
 	value, get_err := kv.get(&new_reader, u64_key(&key, 1))
 	testing.expect(t, get_err == .None && string(value) == "added", "new reader sees old state")
 	expect_tree_ok(t, &new_reader)
+	expect_space_ok(t, &new_reader)
 }
