@@ -68,14 +68,56 @@ end_room :: proc(txn: ^Txn) -> int {
 Finds the lowest run of `n` consecutive pages in Env.free.ready that `txn`
 hasn't taken, ignoring the lowest `skip` untaken pages. Returns the index of
 its first page. For n = 1 that is the lowest untaken page.
+
+The search is linear, so it starts where earlier searches in the
+transaction proved no run starts, and a failed one is not repeated: a
+search for a run at least as long, skipping at least as many pages, fails
+without scanning (see Write_State).
 */
 @(private = "file")
 ready_run_find :: proc(txn: ^Txn, n: int, skip := 0) -> (idx: int, ok: bool) {
 	w := txn.write
+	if w.miss != 0 && n >= w.miss {
+		return 0, false
+	}
+	if w.miss_skipped != 0 && n >= w.miss_skipped && skip >= w.miss_skip {
+		return 0, false
+	}
+	// A skip counts untaken pages from ready_next, so a search that skips
+	// pages can't start later than that.
+	from := w.ready_next
+	if skip == 0 {
+		for k in 2 ..= min(n, RUN_HINTS) {
+			from = max(from, w.run_from[k])
+		}
+	}
+	idx, ok = ready_run_scan(txn, n, skip, from)
+	if ok {
+		if skip == 0 && n >= 2 && n <= RUN_HINTS {
+			w.run_from[n] = idx
+		}
+		return idx, true
+	}
+	// Keep the failure that rules out the most searches: the shortest
+	// length, then the fewest pages skipped.
+	if skip == 0 {
+		if w.miss == 0 || n < w.miss {
+			w.miss = n
+		}
+	} else if w.miss_skipped == 0 || n < w.miss_skipped || (n == w.miss_skipped && skip < w.miss_skip) {
+		w.miss_skipped, w.miss_skip = n, skip
+	}
+	return 0, false
+}
+
+// The scan behind ready_run_find, from index `from` of Env.free.ready.
+@(private = "file")
+ready_run_scan :: proc(txn: ^Txn, n: int, skip: int, from: int) -> (idx: int, ok: bool) {
+	w := txn.write
 	ready, taken := txn.env.free.ready[:], w.taken[:]
 	skip := skip
 	start, length := 0, 0
-	for i in w.ready_next ..< len(ready) {
+	for i in from ..< len(ready) {
 		p := ready[i]
 		for len(taken) > 0 && taken[0] < p {
 			taken = taken[1:]

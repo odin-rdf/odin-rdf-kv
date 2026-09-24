@@ -65,7 +65,26 @@ Write_State :: struct {
 	ready_next:  int,
 	taken:       [dynamic]Pgno,
 	ready_taken: int,
+	// What earlier run searches of Env.free.ready proved, so that later
+	// ones don't scan it again (KV-T-0015). The list doesn't change during
+	// the transaction and pages are only taken from it, so a proof stays
+	// true:
+	// - `run_from[n]`: a search skipping nothing found its run of n at this
+	//   index, so no run of n or more starts before it. The run search's
+	//   counterpart of ready_next, for n in 2 ..= RUN_HINTS.
+	// - `miss`: the shortest length a search skipping nothing found no run
+	//   of, so none is left of that length or more. 0: none yet.
+	// - `miss_skipped`: the same for a search skipping `miss_skip` pages,
+	//   which rules out every search skipping at least as many.
+	run_from:     [RUN_HINTS + 1]int,
+	miss:         int,
+	miss_skipped: int,
+	miss_skip:    int,
 }
+
+// Run lengths for which Write_State remembers where to start searching.
+// Longer runs start from the entry for the longest length below them.
+RUN_HINTS :: 8
 
 // Begins a transaction. Read-only transactions never block and are never
 // blocked by the writer. A read transaction holds its snapshot in the

@@ -689,6 +689,64 @@ test_page_alloc_reuses_lowest_first :: proc(t: ^testing.T) {
 	testing.expect(t, slice.equal(env.free.pending[:], pending), "pending records changed")
 }
 
+// Over many allocations in one transaction, page_alloc hands out exactly
+// what a direct search of the untaken reusable pages gives: the lowest run
+// of the length asked for, else the end of the file. Failed searches are
+// remembered and not repeated (KV-T-0015), and that must never hide a run
+// that is there.
+@(test)
+test_page_alloc_matches_a_direct_search :: proc(t: ^testing.T) {
+	LAST :: 400
+	RUN :: 395
+	for round in 0 ..< 20 {
+		// A random sparse pool, so that runs of every length come and go.
+		records := make([dynamic]kv.Free_Record, context.temp_allocator)
+		free := make([]bool, LAST + 1, context.temp_allocator)
+		density := 0.2 + 0.6 * rand.float64()
+		for p in 2 ..< RUN {
+			if rand.float64() < density {
+				append(&records, kv.Free_Record{pgno = u64le(p)})
+				free[p] = true
+			}
+		}
+		dir := temp_dir_create(t)
+		env, err := open_hand_list(t, temp_dir_file(dir, DB), {records = records[:], run = RUN, count = -1, overflow_count = -1, last_pgno = LAST})
+		testing.expect_value(t, err, kv.Error.None)
+		if err == .None {
+			txn, _ := kv.txn_begin(env, read_only = false)
+			last := kv.Pgno(LAST)
+			for step in 0 ..< 200 {
+				n := 1 + rand.int_max(6)
+				want := kv.Pgno(0)
+				search: for p in 2 ..< RUN - n + 1 {
+					for i in 0 ..< n {
+						if !free[p + i] {
+							continue search
+						}
+					}
+					want = kv.Pgno(p)
+					break
+				}
+				if want == 0 {
+					want = last + 1
+					last += kv.Pgno(n)
+				} else {
+					for i in 0 ..< n {
+						free[int(want) + i] = false
+					}
+				}
+				pgno, _, alloc_err := kv.page_alloc(&txn, n)
+				if !testing.expectf(t, alloc_err == .None && pgno == want, "[seed %d] round %d step %d: page_alloc(%d) = %d, %v; want %d", t.seed, round, step, n, pgno, alloc_err, want) {
+					break
+				}
+			}
+			kv.txn_abort(&txn)
+			kv.env_close(env)
+		}
+		temp_dir_destroy(&dir, DB)
+	}
+}
+
 // `n` tag-0 records for pages first, first + stride, ... (temp allocator).
 @(private = "file")
 ready_records :: proc(first: kv.Pgno, n: int, stride := 1) -> []kv.Free_Record {
@@ -815,6 +873,102 @@ test_put_needs_a_run_the_path_leaves :: proc(t: ^testing.T) {
 		}
 		temp_dir_destroy(&dir, DB)
 	}
+}
+
+// With the map full, a put refused because no run of 3 survives the path
+// is remembered (KV-T-0015), but that refuses neither a later put in the
+// same transaction whose shorter run is there, nor a run of 3 asked for
+// without the path's pages set aside.
+@(test)
+test_put_refused_for_a_run_leaves_shorter_runs :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+
+	// The path takes 2, 3 and 4 at most; 10–11 is the only run left.
+	ready := []kv.Free_Record{{2, 0}, {3, 0}, {4, 0}, {10, 0}, {11, 0}, {20, 0}, {30, 0}}
+	env, err := open_hand_list(t, temp_dir_file(dir, DB), {records = slice.clone(ready, context.temp_allocator), run = 40, count = -1, overflow_count = -1, last_pgno = 63, root = 63, options = {map_size = 256 * 1024}})
+	testing.expect_value(t, err, kv.Error.None)
+	if err != .None {
+		return
+	}
+	defer kv.env_close(env)
+	ps := env.page_size
+	big, small := patterned(2 * ps, 1), patterned(ps + 100, 2)
+	testing.expect(t, kv.overflow_pages(ps, len(big)) == 3 && kv.overflow_pages(ps, len(small)) == 2, "wrong value sizes")
+
+	{
+		// 2–4 is a run of 3, but the put sets it aside for the path.
+		txn, _ := kv.txn_begin(env, read_only = false)
+		defer kv.txn_abort(&txn)
+		testing.expect_value(t, kv.put(&txn, transmute([]byte)string("big"), big), kv.Error.Map_Full)
+		pgno, _, alloc_err := kv.page_alloc(&txn, 3)
+		testing.expectf(t, alloc_err == .None && pgno == 2, "page_alloc(3) = %d, %v; want 2", pgno, alloc_err)
+	}
+
+	txn, _ := kv.txn_begin(env, read_only = false)
+	defer kv.txn_abort(&txn)
+	testing.expect_value(t, kv.put(&txn, transmute([]byte)string("big"), big), kv.Error.Map_Full)
+	testing.expect_value(t, kv.put(&txn, transmute([]byte)string("small"), small), kv.Error.None)
+	testing.expect_value(t, kv.put(&txn, transmute([]byte)string("big"), big), kv.Error.Map_Full)
+	testing.expect_value(t, txn.err, kv.Error.None)
+	testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
+
+	reader, _ := kv.txn_begin(env)
+	defer kv.txn_abort(&reader)
+	got, get_err := kv.get(&reader, transmute([]byte)string("small"))
+	testing.expect(t, get_err == .None && slice.equal(got, small), "small value differs")
+	_, get_err = kv.get(&reader, transmute([]byte)string("big"))
+	testing.expect_value(t, get_err, kv.Error.Not_Found)
+}
+
+// put's up-front check at a full map sets aside the lowest reusable pages
+// for the path and finds its run after them. Where it found one says
+// nothing about the pages it set aside (KV-T-0015): the path takes only
+// one of them, and the value's run is the lowest one left.
+@(test)
+test_put_run_is_lowest_after_the_path :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+
+	// The check sets aside 2, 3 and 4 and finds 10–12. The path takes 2,
+	// so the value goes to 3–5.
+	ready := []kv.Free_Record{{2, 0}, {3, 0}, {4, 0}, {5, 0}, {10, 0}, {11, 0}, {12, 0}}
+	env, err := open_hand_list(t, temp_dir_file(dir, DB), {records = slice.clone(ready, context.temp_allocator), run = 40, count = -1, overflow_count = -1, last_pgno = 63, root = 63, options = {map_size = 256 * 1024}})
+	testing.expect_value(t, err, kv.Error.None)
+	if err != .None {
+		return
+	}
+	defer kv.env_close(env)
+	txn, _ := kv.txn_begin(env, read_only = false)
+	defer kv.txn_abort(&txn)
+	testing.expect_value(t, kv.put(&txn, transmute([]byte)string("big"), patterned(2 * env.page_size, 1)), kv.Error.None)
+	dirty := dirty_pages(&txn)
+	testing.expectf(t, slice.equal(dirty, []kv.Pgno{2, 3, 4, 5}), "dirty pages %v, want [2, 3, 4, 5]", dirty)
+}
+
+// Nor does the check start where an earlier search found a run: it counts
+// the pages it sets aside from the lowest untaken one (KV-T-0015).
+@(test)
+test_put_check_counts_from_the_lowest_page :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+
+	// A 2-page run takes 4–5 and leaves page 2 below it. The check then
+	// sets aside 2, 7 and 8, and finds 10–12.
+	ready := []kv.Free_Record{{2, 0}, {4, 0}, {5, 0}, {7, 0}, {8, 0}, {10, 0}, {11, 0}, {12, 0}}
+	env, err := open_hand_list(t, temp_dir_file(dir, DB), {records = slice.clone(ready, context.temp_allocator), run = 40, count = -1, overflow_count = -1, last_pgno = 63, root = 63, options = {map_size = 256 * 1024}})
+	testing.expect_value(t, err, kv.Error.None)
+	if err != .None {
+		return
+	}
+	defer kv.env_close(env)
+	txn, _ := kv.txn_begin(env, read_only = false)
+	defer kv.txn_abort(&txn)
+	pgno, _, alloc_err := kv.page_alloc(&txn, 2)
+	testing.expectf(t, alloc_err == .None && pgno == 4, "page_alloc(2) = %d, %v; want 4", pgno, alloc_err)
+	testing.expect_value(t, kv.put(&txn, transmute([]byte)string("big"), patterned(2 * env.page_size, 1)), kv.Error.None)
+	dirty := dirty_pages(&txn)
+	testing.expectf(t, slice.equal(dirty, []kv.Pgno{2, 4, 5, 10, 11, 12}), "dirty pages %v, want [2, 4, 5, 10, 11, 12]", dirty)
 }
 
 // A run that doesn't lie within the meta page's last_pgno makes that meta

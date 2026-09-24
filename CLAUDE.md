@@ -13,7 +13,7 @@ Metis (`.metis/`) is the system of record for plans, decisions and progress. Sta
 
 `metis list` shows everything. `metis.db` is gitignored runtime state; after a fresh clone, run `metis sync` to rebuild it from the markdown.
 
-**Next up:** step 4 (delete with merge), then step 6 (the memory budget). Delete frees pages through the same `freed` list, so page reuse needs no changes for it. `Stats` (`env_stats`) is where step 6's figures go. Two backlog items came out of KV-I-0002: KV-T-0014 (placing the free list's run in a fragmented pool) and KV-T-0015 (linear run searches).
+**Next up:** step 4 (delete with merge), then step 6 (the memory budget). Delete frees pages through the same `freed` list, so page reuse needs no changes for it. `Stats` (`env_stats`) is where step 6's figures go. The two backlog items that came out of KV-I-0002 are done: KV-T-0014 (the free list's run may have one page of slack) and KV-T-0015 (a transaction remembers what its run searches proved).
 
 ## Working agreement
 
