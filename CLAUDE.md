@@ -9,12 +9,12 @@ Metis (`.metis/`) is the system of record for plans, decisions and progress. Sta
 - `.metis/vision.md` (KV-V-0001): the design, the build order (steps 1–7) and the current state.
 - `.metis/archived/initiatives/KV-I-0001/initiative.md`: steps 1–3 (completed and archived). Its **Results** section lists the exit-criteria evidence, every deviation from the design, and the known limitations.
 - `.metis/archived/initiatives/KV-I-0002/initiative.md`: step 5, page reuse (completed and archived). Its **Results** section has the same, plus the steady-state and free-list cost measurements.
-- `.metis/initiatives/KV-I-0003/initiative.md`: step 4, delete with merge (completed). Its **Results** section has the exit-criteria evidence, the fill measurement after deletes, and the deviations.
+- `.metis/archived/initiatives/KV-I-0003/initiative.md`: step 4, delete with merge (completed and archived). Its **Results** section has the exit-criteria evidence, the fill measurement after deletes, and the deviations.
 - Each task's **Status Updates** section records decisions made during implementation and the reasons for them.
 
 `metis list` shows everything. `metis.db` is gitignored runtime state; after a fresh clone, run `metis sync` to rebuild it from the markdown.
 
-**Next up:** step 6 (the memory budget). Delete (step 4) is done: KV-I-0003, in `.metis/initiatives/KV-I-0003/` until it is archived. `Stats` (`env_stats`) is where step 6's figures go.
+**Next up:** step 6 (the memory budget). Delete (step 4) is done: KV-I-0003. `Stats` (`env_stats`) is where step 6's figures go.
 
 ## Working agreement
 

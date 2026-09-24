@@ -4,14 +4,14 @@ level: initiative
 title: "Delete with merge"
 short_code: "KV-I-0003"
 created_at: 2026-09-24T16:17:57.045959+00:00
-updated_at: 2026-09-24T17:51:08.130173+00:00
+updated_at: 2026-09-24T18:26:18.876854+00:00
 parent: KV-V-0001
 blocked_by: []
-archived: false
+archived: true
 
 tags:
   - "#initiative"
-  - "#phase/active"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
