@@ -46,7 +46,7 @@ The upstream C sources in `liblmdb/` are a reference for comparison. This design
 - KV-I-0003 (build step 4, delete with merge) is implemented (2026-09-24): `del` removes a key and its overflow run, merges an underfull page with a sibling when they fit (the sibling merges into the already-copied page, so a delete needs at most `depth` new pages), drops empty pages and collapses the root. There is no borrowing. The suite has 132 tests on macOS and Linux. Its Results section has the evidence:
   - **Page reuse under churn:** inserting and deleting over a moving key set keeps the file bounded (352 pages loaded, 368–373 after 10⁴ commits, none added in the second half).
   - **Fill after deletes:** about 40% after random deletes against 70% for an insert-only tree of the same keys, so 1.6–1.8× the leaves, but no leaf below 25% in the measurement.
-- The memory budget (step 6) and crash testing (step 7) remain.
+- The memory budget (step 6) and crash testing (step 7) remain. Step 6 is planned as KV-I-0004 (2026-09-24), shaped by the first deployment: about 250 processes per server, each embedding a store, with low, request-driven load. Its one departure from this document: **there is no sweeper thread**; the application calls `env_sweep` (for example after each request, and with a target of 0 to put an idle store to sleep), and a read past the hard watermark evicts inline. This section's design is amended when the initiative completes.
 - Toolchain: Odin `dev-2026-09`. The development platform is macOS (Darwin). Linux is also a target.
 
 ## Future State

@@ -14,7 +14,9 @@ Metis (`.metis/`) is the system of record for plans, decisions and progress. Sta
 
 `metis list` shows everything. `metis.db` is gitignored runtime state; after a fresh clone, run `metis sync` to rebuild it from the markdown.
 
-**Next up:** step 6 (the memory budget). Delete (step 4) is done: KV-I-0003. `Stats` (`env_stats`) is where step 6's figures go.
+- `.metis/initiatives/KV-I-0004/initiative.md`: step 6, the memory budget (decomposed, tasks KV-T-0019 to KV-T-0024). Its decisions D1–D12 are approved; the first task is a platform measurement whose results can amend D1, D9 and D10.
+
+**Next up:** KV-T-0019, the eviction and residency measurement. `Stats` (`env_stats`) is where step 6's figures go.
 
 ## Working agreement
 
