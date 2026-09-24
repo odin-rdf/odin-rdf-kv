@@ -307,7 +307,8 @@ is allowed at open (FREELIST_RUN_SLACK, KV-T-0014).
 
 If no run of the shortest length is free, no longer one is either, and the
 run extends the file with the exact length k. If the map has no room for
-that, the commit fails with Map_Full (KV-I-0002 D6).
+that, the commit fails with Map_Full (KV-I-0002 D6). If the dirty-page pool has no
+run of free slots for it, the commit fails with Out_Of_Memory.
 */
 @(private)
 freelist_place :: proc(txn: ^Txn, next: ^Free_State) -> (pgno: Pgno, pages: int, buf: []byte, err: Error) {
@@ -325,9 +326,9 @@ freelist_place :: proc(txn: ^Txn, next: ^Free_State) -> (pgno: Pgno, pages: int,
 		if !found {
 			break
 		}
+		slot := pool_alloc(&txn.env.pool, j, txn.mods) or_return
 		pgno = next.ready[idx]
-		buf = dirty_buf_alloc(txn, j) or_return
-		txn.write.dirty[pgno] = buf
+		buf = dirty_add(txn, pgno, slot, j)
 		remove_range(&next.ready, idx, idx + j)
 		return pgno, j, buf, .None
 	}

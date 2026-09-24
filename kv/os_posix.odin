@@ -135,3 +135,29 @@ os_advise_random :: proc(base: [^]byte, map_size: int) -> Error {
 	}
 	return .None
 }
+
+// The OS's page size, the unit memory is protected and released in. 16 KiB
+// on Apple Silicon, whatever the database's page size.
+os_page_size :: proc() -> int {
+	return int(posix.sysconf(._PAGESIZE))
+}
+
+// Reserves `size` bytes of private anonymous address space for the
+// dirty-page pool: inaccessible, and backed by no memory until committed.
+os_pool_reserve :: proc(size: int) -> (base: [^]byte, err: Error) {
+	p := posix.mmap(nil, c.size_t(size), {}, {.PRIVATE, .ANONYMOUS}, -1, 0)
+	if p == posix.MAP_FAILED {
+		return nil, .Out_Of_Memory
+	}
+	return ([^]byte)(p), .None
+}
+
+// Makes a reserved range of the pool readable and writable. Its pages are
+// zero, and take memory as they are first written. `addr` and `size` are
+// multiples of the OS page size.
+os_pool_commit :: proc(addr: rawptr, size: int) -> Error {
+	if posix.mprotect(addr, c.size_t(size), {.READ, .WRITE}) != .OK {
+		return .Out_Of_Memory
+	}
+	return .None
+}

@@ -48,3 +48,17 @@ temp_dir_destroy :: proc(dir: ^Temp_Dir, files: ..string) {
 	delete(dir.path)
 	dir.path = ""
 }
+
+// The buffer holding dirty page (or run) `pgno` of write transaction `txn`,
+// in the env's dirty-page pool: every page of a run.
+dirty_buf :: proc(txn: ^kv.Txn, pgno: kv.Pgno) -> (buf: []byte, ok: bool) {
+	d := txn.write.dirty[pgno] or_return
+	ps := txn.env.page_size
+	off := int(d.slot) * ps
+	return txn.env.pool.base[off:off + int(d.pages) * ps], true
+}
+
+// A dirty-page budget for tests whose single transaction writes more than
+// DEFAULT_DIRTY_BUDGET: until spilling (KV-T-0021), a transaction's dirty
+// pages must fit in the pool. The pool is address space until used.
+BIG_DIRTY_BUDGET :: 64 << 20

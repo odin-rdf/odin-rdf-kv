@@ -1,12 +1,12 @@
 package kv
 
-import "core:mem/virtual"
 import "core:slice"
 
 /*
 Allocates `n` contiguous pages and registers them as dirty. The returned
-buffer is page-aligned, `n` pages long and new: a reused page's old
-contents are never read. The caller initialises it.
+buffer is `n` consecutive slots of the dirty-page pool, page-aligned, and
+new: a reused page's old contents are never read. The caller initialises
+it.
 
 The pages come from the first of these with room:
 - for a single page, the transaction's loose pages;
@@ -16,21 +16,22 @@ The pages come from the first of these with room:
   transaction records what it took (see Write_State);
 - the end of the database, which grows by `n` pages.
 
-Returns Map_Full if none of them has room.
+Returns Map_Full if none of them has room, and Out_Of_Memory if the pool
+has no `n` consecutive free slots.
 */
 page_alloc :: proc(txn: ^Txn, n: int) -> (pgno: Pgno, buf: []byte, err: Error) {
 	w := txn.write
+	slot: u32
 	if n == 1 && len(w.loose) > 0 {
-		buf = dirty_buf_alloc(txn, n) or_return
+		slot = pool_alloc(&txn.env.pool, n, txn.mods) or_return
 		pgno = pop(&w.loose)
 	} else if idx, found := ready_run_find(txn, n); found {
-		buf = dirty_buf_alloc(txn, n) or_return
+		slot = pool_alloc(&txn.env.pool, n, txn.mods) or_return
 		pgno = ready_take(txn, idx, n) or_return
 	} else {
 		return page_alloc_end(txn, n)
 	}
-	w.dirty[pgno] = buf
-	return pgno, buf, .None
+	return pgno, dirty_add(txn, pgno, slot, n), .None
 }
 
 // Allocates `n` new pages at the end of the database, as page_alloc does.
@@ -39,23 +40,18 @@ page_alloc_end :: proc(txn: ^Txn, n: int) -> (pgno: Pgno, buf: []byte, err: Erro
 	if end_room(txn) < n {
 		return 0, nil, .Map_Full
 	}
-	buf = dirty_buf_alloc(txn, n) or_return
+	slot := pool_alloc(&txn.env.pool, n, txn.mods) or_return
 	pgno = txn.snapshot.last_pgno + 1
 	txn.snapshot.last_pgno += Pgno(n)
-	txn.write.dirty[pgno] = buf
-	return pgno, buf, .None
+	return pgno, dirty_add(txn, pgno, slot, n), .None
 }
 
-// A page-aligned buffer for `n` dirty pages, from the transaction's arena.
+// Registers the `n` pages at `pgno` as dirty, held in the pool from `slot`,
+// and returns their buffer.
 @(private)
-dirty_buf_alloc :: proc(txn: ^Txn, n: int) -> (buf: []byte, err: Error) {
-	ps := txn.env.page_size
-	alloc_err: virtual.Allocator_Error
-	buf, alloc_err = virtual.arena_alloc(&txn.write.arena, uint(n * ps), uint(ps))
-	if alloc_err != nil {
-		return nil, .Out_Of_Memory
-	}
-	return buf, .None
+dirty_add :: proc(txn: ^Txn, pgno: Pgno, slot: u32, n: int) -> []byte {
+	txn.write.dirty[pgno] = Dirty_Page{slot = slot, pages = u32(n)}
+	return pool_pages(&txn.env.pool, slot, u32(n))
 }
 
 // Number of pages that still fit in the map after the snapshot's last page.
@@ -207,15 +203,18 @@ pages_available :: proc(txn: ^Txn, singles: int, run := 0) -> bool {
 Drops the `count` pages starting at `pgno`, a single page or an overflow run,
 that the tree no longer uses. Pages of the snapshot are recorded as freed,
 for the free list to release once no reader can see them. Pages this
-transaction wrote (their buffer is in `dirty` under `pgno`) were never seen
-by anyone, so they are discarded and recorded as loose, for page_alloc to
-hand out again (KV-I-0003 D8).
+transaction wrote (they are in `dirty` under `pgno`) were never seen by
+anyone, so they are discarded and recorded as loose, for page_alloc to
+hand out again (KV-I-0003 D8), and their pool slots are free for the
+transaction's next page_alloc.
 */
 @(private)
 page_free :: proc(txn: ^Txn, pgno: Pgno, count := 1) {
 	w := txn.write
 	list := &w.freed
-	if pgno in w.dirty {
+	if d, ok := w.dirty[pgno]; ok {
+		assert(int(d.pages) == count, "freeing part of a dirty run")
+		pool_free(&txn.env.pool, d.slot, d.pages)
 		delete_key(&w.dirty, pgno)
 		list = &w.loose
 	}
@@ -232,8 +231,9 @@ top-down) is pointed at the copy, and the path is updated.
 */
 page_touch :: proc(txn: ^Txn, path: ^Path, level: int) -> (page: []byte, err: Error) {
 	e := &path.entries[level]
-	if buf, ok := txn.write.dirty[e.pgno]; ok {
-		return buf, .None
+	if d, ok := txn.write.dirty[e.pgno]; ok {
+		txn.env.pool.touched[d.slot] = txn.mods
+		return pool_pages(&txn.env.pool, d.slot, 1), .None
 	}
 
 	pgno, buf := page_alloc(txn, 1) or_return
@@ -259,7 +259,10 @@ a slice returned by `get` in the same write transaction: the insert moves
 bytes around within those pages. Copy such data first.
 
 Returns `Map_Full` without changing anything if the worst case of this put
-might not fit in the reusable pages and the room left in the map. Any other failure after the tree has started to
+might not fit in the reusable pages and the room left in the map, and
+`Out_Of_Memory` if it might not fit in the free slots of the dirty-page
+pool (until spilling, KV-T-0021, a transaction's dirty pages must fit in
+Options.dirty_budget). Any other failure after the tree has started to
 change leaves the transaction unusable: later calls return the same error,
 and it can only be aborted.
 */
@@ -286,6 +289,9 @@ put :: proc(txn: ^Txn, key, value: []byte) -> Error {
 	}
 	if !pages_available(txn, singles, run) {
 		return .Map_Full
+	}
+	if !pool_available(&txn.env.pool, singles, run) {
+		return .Out_Of_Memory
 	}
 
 	err := put_unchecked(txn, key, value)

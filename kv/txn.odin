@@ -39,11 +39,13 @@ Txn :: struct {
 }
 
 Write_State :: struct {
-	// Owns every dirty page buffer, the dirty map and the freed list.
+	// Owns the dirty map and the page lists. The dirty pages themselves are
+	// in Env.pool.
 	arena: virtual.Arena,
-	// Pages written by this transaction, by page number. An overflow run is
-	// stored as one buffer under its first page number.
-	dirty: map[Pgno][]byte,
+	// Pages written by this transaction, by page number: the pool slot
+	// holding each. An overflow run or the free-list run is stored under its
+	// first page number, in consecutive slots.
+	dirty: map[Pgno]Dirty_Page,
 	// Pages of the snapshot that this transaction replaced. The commit puts
 	// them on the free list, tagged with its own txn_id.
 	freed: [dynamic]Pgno,
@@ -98,7 +100,7 @@ txn_begin :: proc(env: ^Env, read_only := true) -> (txn: Txn, err: Error) {
 			return {}, .Out_Of_Memory
 		}
 		arena := virtual.arena_allocator(&w.arena)
-		w.dirty = make(map[Pgno][]byte, arena)
+		w.dirty = make(map[Pgno]Dirty_Page, arena)
 		w.freed = make([dynamic]Pgno, arena)
 		w.loose = make([dynamic]Pgno, arena)
 		w.taken = make([dynamic]Pgno, arena)
@@ -181,8 +183,10 @@ txn_abort :: proc(txn: ^Txn) {
 	sync.atomic_sub(&txn.env.active_txns, 1)
 }
 
+// Frees the write transaction's state and releases the pool's memory.
 @(private)
 write_state_free :: proc(txn: ^Txn) {
+	pool_release(&txn.env.pool)
 	virtual.arena_destroy(&txn.write.arena)
 	free(txn.write, txn.env.allocator)
 	txn.write = nil
@@ -198,8 +202,8 @@ page_ptr :: #force_inline proc(txn: ^Txn, pgno: Pgno) -> []byte {
 	}
 	ps := txn.env.page_size
 	if txn.write != nil {
-		if buf, ok := txn.write.dirty[pgno]; ok {
-			return buf[:ps]
+		if d, ok := txn.write.dirty[pgno]; ok {
+			return pool_pages(&txn.env.pool, d.slot, 1)
 		}
 	}
 	// The memory budget (step 6) hooks residency accounting in here.

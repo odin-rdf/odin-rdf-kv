@@ -29,9 +29,10 @@ previous commit intact:
 On failure the transaction is aborted and the error returned; the database
 and the env's free list stay at the previous commit, including the pages
 the transaction took from it. Map_Full here means the free list's run fit
-neither in reusable pages nor in the map (KV-I-0002 D6). If only the final
-sync fails, the new meta page may or may not have reached the disk: the
-next open sees whichever state is durable, and this process keeps the
+neither in reusable pages nor in the map (KV-I-0002 D6), and Out_Of_Memory
+that it didn't fit in the free slots of the dirty-page pool. If only the
+final sync fails, the new meta page may or may not have reached the disk:
+the next open sees whichever state is durable, and this process keeps the
 previous one.
 
 Committing a read-only transaction, or a write transaction that changed
@@ -84,7 +85,8 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 	}
 	slice.sort(pgnos)
 	for pgno in pgnos {
-		os_pwrite(env.fd, txn.write.dirty[pgno], i64(pgno) * ps) or_return
+		d := txn.write.dirty[pgno]
+		os_pwrite(env.fd, pool_pages(&env.pool, d.slot, d.pages), i64(pgno) * ps) or_return
 	}
 	os_sync(env.fd) or_return
 

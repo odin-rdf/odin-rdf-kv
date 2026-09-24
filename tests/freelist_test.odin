@@ -231,8 +231,8 @@ release_before :: proc(want: ^Expected_Free, s: u64le) {
 // included (temp allocator).
 dirty_pages :: proc(txn: ^kv.Txn) -> []kv.Pgno {
 	pages := make([dynamic]kv.Pgno, context.temp_allocator)
-	for pgno, buf in txn.write.dirty {
-		for i in 0 ..< len(buf) / txn.env.page_size {
+	for pgno, d in txn.write.dirty {
+		for i in 0 ..< int(d.pages) {
 			append(&pages, pgno + kv.Pgno(i))
 		}
 	}
@@ -679,7 +679,8 @@ test_page_alloc_reuses_lowest_first :: proc(t: ^testing.T) {
 	for step, i in steps {
 		pgno, buf, alloc_err := kv.page_alloc(&txn, step.n)
 		testing.expectf(t, alloc_err == .None && pgno == step.want, "step %d: page_alloc(%d) = %d, %v; want %d", i, step.n, pgno, alloc_err, step.want)
-		testing.expectf(t, len(buf) == step.n * env.page_size && raw_data(txn.write.dirty[pgno]) == raw_data(buf), "step %d: buffer not registered", i)
+		dirty, _ := dirty_buf(&txn, pgno)
+		testing.expectf(t, len(buf) == step.n * env.page_size && raw_data(dirty) == raw_data(buf), "step %d: buffer not registered", i)
 	}
 	testing.expect(t, slice.equal(txn.write.taken[:], []kv.Pgno{6, 7, 11, 12, 13, 14}), "wrong runs taken")
 	testing.expect_value(t, txn.write.ready_next, len(ready))

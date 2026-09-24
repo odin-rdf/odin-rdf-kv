@@ -109,7 +109,7 @@ test_overflow_10mb_value :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, DB)
 
-	env, txn, ok := open_write(t, temp_dir_file(dir, DB))
+	env, txn, ok := open_write(t, temp_dir_file(dir, DB), kv.Options{dirty_budget = BIG_DIRTY_BUDGET})
 	if !ok {
 		return
 	}

@@ -16,7 +16,7 @@ Metis (`.metis/`) is the system of record for plans, decisions and progress. Sta
 
 - `.metis/initiatives/KV-I-0004/initiative.md`: step 6, the memory budget (decomposed, tasks KV-T-0019 to KV-T-0024). Its decisions D1–D12 are approved; the first task is a platform measurement whose results can amend D1, D9 and D10.
 
-**Next up:** KV-T-0019, the eviction and residency measurement. `Stats` (`env_stats`) is where step 6's figures go.
+**Next up:** KV-T-0021, spilling (KV-I-0004 D2–D6). The measurement (KV-T-0019) and the dirty-page pool (KV-T-0020) are done. `Stats` (`env_stats`) is where step 6's figures go.
 
 ## Working agreement
 
@@ -56,7 +56,8 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 | `page.odin` | On-disk page and node layout, size limits, slotted-page operations, split and merge helpers, `page_check` |
 | `meta.odin` | Meta page layout and checksum |
 | `env.odin` | Open and close, choosing the meta page, `meta_write`, the reader table, `env_stats` |
-| `txn.odin` | `Txn` (a value type), `Write_State` (on the heap), the reuse horizon, `page_ptr` |
+| `txn.odin` | `Txn` (a value type), `Write_State` (on the heap; `dirty` maps a page number to its pool slots), the reuse horizon, `page_ptr` |
+| `pool.odin` | `Dirty_Pool`, the dirty-page pool (KV-I-0004 D1): slots reserved at open, committed on first use, released when the write transaction ends; `pool_available` for the up-front `Out_Of_Memory` check |
 | `tree.odin` | `tree_search`, `get` |
 | `write.odin` | `page_alloc` (loose, then reusable, then the end of the file), `pages_available`, `page_free`, `page_touch`, `put`, splits |
 | `freelist.odin` | Free-list records and run layout, load and validate at open, release at `txn_begin`, build and place at commit |
@@ -65,16 +66,16 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 | `delete.odin` | `del`: removal, the rebalance loop (merge with a sibling, drop empty pages) and root collapse |
 | `cursor.odin` | Cursors |
 | `check.odin` | `tree_check`, and `space_check` (every page owned exactly once) |
-| `os_*.odin` | Platform layer |
+| `os_*.odin` | Platform layer, including the pool's reserve, commit and release (`os_pool_release`: `MAP_FIXED` remap on macOS, `madvise(MADV_DONTNEED)` on Linux) |
 
 **Test helpers:**
 - `tests/tree_helpers.odin`: `build_tree_file` builds a packed tree directly; `build_tree_shape` builds any shape, with each leaf's entries and each level's grouping given (underfull pages, single-child branches).
 - `tests/model.odin`: the randomized model and `model_diff`. `run_model` in `tests/model_test.odin` also holds up to 4 readers across commits.
-- `tests/helpers.odin`: temporary directories and `Page_Buf`.
+- `tests/helpers.odin`: temporary directories, `Page_Buf`, `dirty_buf` (a dirty page's pool buffer) and `BIG_DIRTY_BUDGET` (for tests whose one transaction outgrows the default pool, until spilling).
 - `tests/freelist_test.odin`: `open_hand_list` opens a database with a hand-written free list.
 - `tests/steady_test.odin`: the steady-state workload (`steady_commit`) and `expect_latest_ok` (`space_check` and `tree_check` on a new reader).
 
-**Other test files:** `delete_test.odin` (delete shapes and semantics; `sized_entries`, `expect_shape_keys`, `commit_ok`), `reader_test.odin` (reader table), `reuse_test.odin` (reuse rules), `steady_test.odin` (`env_stats`; plateau, full map, long reader and insert/delete churn on demand), `isolation_test.odin` (threads, including readers that come and go while pages are reused), `bench_test.odin` and `fill_test.odin` (the free-list cost and the fill after deletes, only registered with `-define:KV_BENCH=true`).
+**Other test files:** `delete_test.odin` (delete shapes and semantics; `sized_entries`, `expect_shape_keys`, `commit_ok`), `reader_test.odin` (reader table), `reuse_test.odin` (reuse rules), `steady_test.odin` (`env_stats`; plateau, full map, long reader and insert/delete churn on demand), `isolation_test.odin` (threads, including readers that come and go while pages are reused), `pool_test.odin` (the dirty-page pool: budget, live figures, release checked against the OS, `Out_Of_Memory`), `platform_test.odin` (KV-T-0019's measurement, only registered with `-define:KV_PLATFORM=true`; `platform_residency` is usable by any test), `bench_test.odin` and `fill_test.odin` (the free-list cost and the fill after deletes, only registered with `-define:KV_BENCH=true`).
 
 ## Invariants and conventions
 
@@ -91,6 +92,7 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 - **Byte order:** integer keys must be encoded big-endian to sort numerically, and inline values have no alignment guarantee.
 - **Write-path tests need a committed tree underneath.** Put into a tree that was committed first (for example with `build_tree_file`), otherwise every page is already dirty and copy-on-write never runs.
 - **Structural checks:** tests call `kv.tree_check` or `kv.page_check` after changes, and `kv.space_check` after every commit.
+- **Dirty pages live in `Env.pool`,** not in the transaction: `page_free` of a dirty page frees its slots for the next `page_alloc`, so don't read a page after freeing it. Every slot is released when the write transaction ends.
 - **Free pages:** a page freed by commit `T` is reused only once `T ≤ min(oldest reader, S − 1)` (KV-I-0002 D1). `Env.free` changes only at `txn_begin(rw)` (the release) and after a durable commit; a write transaction records what it takes instead.
 
 ## Pitfalls hit so far

@@ -168,7 +168,7 @@ test_snapshot_isolation_across_threads :: proc(t: ^testing.T) {
 	value_buf := make([]byte, MODEL_MAX_VALUE, context.temp_allocator)
 	ps := kv.DEFAULT_PAGE_SIZE
 
-	env, err := kv.env_open(temp_dir_file(dir, DB), kv.Options{map_size = 4 << 30})
+	env, err := kv.env_open(temp_dir_file(dir, DB), kv.Options{map_size = 4 << 30, dirty_budget = BIG_DIRTY_BUDGET})
 	testing.expect_value(t, err, kv.Error.None)
 	if err != .None {
 		return

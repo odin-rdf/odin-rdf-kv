@@ -18,7 +18,7 @@ test_reads_allocate_nothing :: proc(t: ^testing.T) {
 	ks := key_space_make(KEYS)
 	value_buf := make([]byte, MODEL_MAX_VALUE, context.temp_allocator)
 
-	env, err := kv.env_open(path)
+	env, err := kv.env_open(path, kv.Options{dirty_budget = BIG_DIRTY_BUDGET})
 	testing.expect_value(t, err, kv.Error.None)
 	if err != .None {
 		return

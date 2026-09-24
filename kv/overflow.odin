@@ -39,8 +39,8 @@ overflow_value :: proc(txn: ^Txn, pgno: Pgno, val_len: int) -> (value: []byte, e
 	count := overflow_check(txn, pgno, val_len) or_return
 	start := PAGE_HEADER_SIZE
 	if txn.write != nil {
-		if buf, ok := txn.write.dirty[pgno]; ok {
-			return buf[start:start + val_len], .None
+		if d, ok := txn.write.dirty[pgno]; ok {
+			return pool_pages(&txn.env.pool, d.slot, d.pages)[start:start + val_len], .None
 		}
 	}
 	ps := txn.env.page_size

@@ -17,10 +17,15 @@ MAP_SIZE_GRANULE :: 64 * 1024
 Options :: struct {
 	// Bytes of address space to reserve; 0 means DEFAULT_MAP_SIZE. It is
 	// enlarged if the existing file is bigger.
-	map_size:  int,
+	map_size:     int,
 	// Page size for a new database; 0 means DEFAULT_PAGE_SIZE. An existing
 	// database keeps the page size it was created with.
-	page_size: int,
+	page_size:    int,
+	// Bytes of memory for a write transaction's dirty pages (KV-I-0004 D1);
+	// 0 means DEFAULT_DIRTY_BUDGET. Rounded up to whole pages, and at least
+	// MIN_DIRTY_PAGES of them. It is address space until a write
+	// transaction uses it, and released when that transaction ends.
+	dirty_budget: int,
 }
 
 // The committed state that a transaction starts from.
@@ -50,28 +55,39 @@ Reader_Slot :: struct {
 Figures about an Env, as returned by env_stats. They are read together
 under one lock, so they describe one instant, but they can be stale as
 soon as env_stats returns. A write transaction in progress shows in none of
-them until it commits.
+them until it commits, except the dirty-pool figures (dirty_pages,
+dirty_committed), which are live: read atomically while it runs, and not
+necessarily at the same instant as the rest.
 
-Step 6 (the memory budget) extends this with the resident estimate, dirty
-pages, spills and evictions; code that builds a Stats should name its
+Step 6 (the memory budget) extends this further with the resident
+estimate, spills and evictions; code that builds a Stats should name its
 fields.
 */
 Stats :: struct {
 	// The last page of the latest committed snapshot.
-	last_pgno:     Pgno,
+	last_pgno:       Pgno,
 	// Pages in the file. The file grows ahead of last_pgno in steps (see
 	// FILE_GROWTH_MIN), and never shrinks.
-	file_pages:    int,
+	file_pages:      int,
 	// Free pages that a write transaction beginning now may reuse. The
 	// release at txn_begin moves pending pages here, so after readers end
 	// this count only catches up when the next write transaction begins.
-	free_ready:    int,
+	free_ready:      int,
 	// Free pages still waiting for older snapshots to end (KV-I-0002 REQ-002).
-	free_pending:  int,
+	free_pending:    int,
 	// Live read transactions.
-	readers:       int,
+	readers:         int,
 	// The oldest snapshot a live read transaction holds, or 0 if none does.
-	oldest_reader: Txn_Id,
+	oldest_reader:   Txn_Id,
+	// The dirty-page pool's size in bytes (Options.dirty_budget, rounded).
+	dirty_budget:    int,
+	// Pool slots (pages) in use by the current write transaction; 0 when
+	// none is open. Live.
+	dirty_pages:     int,
+	// Bytes of the pool committed (backed by memory); 0 when no write
+	// transaction is open. Commits are in whole OS pages, so with pages
+	// smaller than the OS's this can exceed dirty_pages' bytes. Live.
+	dirty_committed: int,
 }
 
 Env :: struct {
@@ -93,6 +109,9 @@ Env :: struct {
 	// The free list of the last commit. Owned by the writer: only used with
 	// writer_mutex held, and replaced by a commit once it is durable.
 	free:           Free_State,
+	// The memory dirty pages live in (see pool.odin). Owned by the writer,
+	// like `free`.
+	pool:           Dirty_Pool,
 	// The writer's figures for env_stats: file_pages, free_ready and
 	// free_pending, copied from file_size and `free` whenever the writer
 	// changes those. Guarded by snapshot_mutex, so env_stats never waits
@@ -112,6 +131,7 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 		return nil, .Invalid_Argument
 	}
 	map_size := options.map_size if options.map_size > 0 else DEFAULT_MAP_SIZE
+	dirty_budget := options.dirty_budget if options.dirty_budget != 0 else DEFAULT_DIRTY_BUDGET
 
 	fd := os_open(path, create = true) or_return
 	defer if err != .None {
@@ -142,6 +162,13 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 		free_state_destroy(&free_state)
 	}
 
+	// Checked against the page size the database has, not the one asked for.
+	pool: Dirty_Pool
+	pool_init(&pool, dirty_budget, meta_page_size, allocator) or_return
+	defer if err != .None {
+		pool_destroy(&pool, allocator)
+	}
+
 	readers, readers_err := make([dynamic]Reader_Slot, 0, READER_TABLE_CAPACITY, allocator)
 	if readers_err != nil {
 		return nil, .Out_Of_Memory
@@ -160,6 +187,7 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 		snapshot  = snapshot,
 		readers   = readers,
 		free      = free_state,
+		pool      = pool,
 		allocator = allocator,
 	}
 	env.stats.file_pages = int(file_size) / meta_page_size
@@ -178,6 +206,7 @@ env_close :: proc(env: ^Env) {
 	os_close(env.fd)
 	delete(env.readers)
 	free_state_destroy(&env.free)
+	pool_destroy(&env.pool, env.allocator)
 	free(env, env.allocator)
 }
 
@@ -194,7 +223,7 @@ thread, including one with a transaction open: it only takes snapshot_mutex,
 briefly, and never waits for a write transaction to end. The free-page
 counts are those of the last commit, plus any release done since by a
 beginning write transaction; a write transaction in progress doesn't change
-them until it commits.
+them until it commits. The dirty-pool figures are live.
 */
 env_stats :: proc(env: ^Env) -> Stats {
 	sync.mutex_lock(&env.snapshot_mutex)
@@ -205,6 +234,9 @@ env_stats :: proc(env: ^Env) -> Stats {
 		stats.readers += slot.count
 	}
 	stats.oldest_reader, _ = oldest_reader(env)
+	stats.dirty_budget = env.pool.slots * env.page_size
+	stats.dirty_pages = sync.atomic_load(&env.pool.in_use)
+	stats.dirty_committed = sync.atomic_load(&env.pool.committed_bytes)
 	return stats
 }
 

@@ -269,16 +269,11 @@ test_reuse_loose_and_touched_pages :: proc(t: ^testing.T) {
 	testing.expect_value(t, txn.write.ready_taken, taken)
 
 	// An overflow run replaced within the transaction becomes loose, and
-	// its pages are the next single pages handed out, each with a new
-	// buffer rather than the old run's or the map's.
+	// its pages are the next single pages handed out, each in a pool slot
+	// rather than in the map. (The old run's slots are free again, so the
+	// new pages may be in them.)
 	big := transmute([]byte)string("big")
 	testing.expect_value(t, kv.put(&txn, big, patterned(3 * env.page_size, 1)), kv.Error.None)
-	old_buf: []byte
-	for _, buf in txn.write.dirty {
-		if len(buf) > env.page_size {
-			old_buf = buf
-		}
-	}
 	testing.expect_value(t, kv.put(&txn, big, patterned(2 * env.page_size, 2)), kv.Error.None)
 	loose := slice.clone(txn.write.loose[:], context.temp_allocator)
 	testing.expect_value(t, len(loose), kv.overflow_pages(env.page_size, 3 * env.page_size))
@@ -288,10 +283,10 @@ test_reuse_loose_and_touched_pages :: proc(t: ^testing.T) {
 		testing.expect_value(t, alloc_err, kv.Error.None)
 		testing.expectf(t, slice.contains(loose, pgno), "page %d is not a loose page", pgno)
 		p := uintptr(raw_data(buf))
-		in_map := p >= uintptr(env.map_base) && p < uintptr(env.map_base) + uintptr(env.map_size)
-		in_old := p >= uintptr(raw_data(old_buf)) && p < uintptr(raw_data(old_buf)) + uintptr(len(old_buf))
-		testing.expect(t, !in_map && !in_old, "reused page did not get a new buffer")
-		testing.expect(t, raw_data(txn.write.dirty[pgno]) == raw_data(buf), "reused page not registered as dirty")
+		in_pool := p >= uintptr(env.pool.base) && p < uintptr(env.pool.base) + uintptr(env.pool.reserved)
+		testing.expect(t, in_pool, "reused page not in the dirty-page pool")
+		dirty, _ := dirty_buf(&txn, pgno)
+		testing.expect(t, raw_data(dirty) == raw_data(buf), "reused page not registered as dirty")
 	}
 	testing.expect_value(t, len(txn.write.loose), 0)
 }
@@ -431,8 +426,9 @@ test_reuse_failed_commit_keeps_both_snapshots :: proc(t: ^testing.T) {
 		kv.put(&txn, u64_key(&key, u64(2 * i)), round_value(i, 5))
 	}
 	reused := 0
-	for pgno, buf in txn.write.dirty {
+	for pgno in txn.write.dirty {
 		if pgno <= s.last_pgno {
+			buf, _ := dirty_buf(&txn, pgno)
 			testing.expect_value(t, kv.os_pwrite(env.fd, buf, i64(pgno) * i64(env.page_size)), kv.Error.None)
 			reused += 1
 		}

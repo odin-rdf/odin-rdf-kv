@@ -161,7 +161,7 @@ test_env_stats :: proc(t: ^testing.T) {
 	if err != .None {
 		return
 	}
-	testing.expect_value(t, kv.env_stats(env), kv.Stats{last_pgno = 1, file_pages = 2})
+	testing.expect_value(t, kv.env_stats(env), kv.Stats{last_pgno = 1, file_pages = 2, dirty_budget = kv.DEFAULT_DIRTY_BUDGET})
 
 	// Figures that must match the env's own state, with no transaction open
 	// or from the thread that has the write transaction.
@@ -213,9 +213,14 @@ test_env_stats :: proc(t: ^testing.T) {
 		model[i] = 5
 	}
 	testing.expect(t, txn.write.ready_taken > 0 && len(txn.write.freed) > 0, "the transaction took or freed nothing")
-	testing.expect_value(t, kv.env_stats(env), s)
+	// Except the dirty pool's figures, which are live.
+	live := kv.env_stats(env)
+	testing.expect(t, live.dirty_pages > 0 && live.dirty_committed >= live.dirty_pages * env.page_size, "dirty pages not reported live")
+	live.dirty_pages, live.dirty_committed = s.dirty_pages, s.dirty_committed
+	testing.expect_value(t, live, s)
 	testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
-	expect_matches(t, env, 0, 0)
+	s = expect_matches(t, env, 0, 0)
+	testing.expect(t, s.dirty_pages == 0 && s.dirty_committed == 0, "dirty pages reported after the commit")
 
 	// A reader in this thread counts while it is open.
 	reader, _ := kv.txn_begin(env)

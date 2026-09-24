@@ -31,9 +31,10 @@ siblings, so a page can stay underfull (KV-I-0003 D1).
 
 Returns Map_Full without changing anything if the pages the delete copies
 might not fit: a delete copies its path before it can free anything, and
-the pages it frees only become reusable after later commits. Any other
-failure after the tree has started to change leaves the transaction
-unusable, as with `put`.
+the pages it frees only become reusable after later commits. Returns
+Out_Of_Memory without changing anything if those copies might not fit in
+the dirty-page pool. Any other failure after the tree has started to
+change leaves the transaction unusable, as with `put`.
 */
 del :: proc(txn: ^Txn, key: []byte) -> Error {
 	if txn.read_only {
@@ -51,6 +52,9 @@ del :: proc(txn: ^Txn, key: []byte) -> Error {
 	// delete allocates (KV-I-0003 D2).
 	if !pages_available(txn, path.depth) {
 		return .Map_Full
+	}
+	if !pool_available(&txn.env.pool, path.depth) {
+		return .Out_Of_Memory
 	}
 
 	err := del_unchecked(txn, &path)
