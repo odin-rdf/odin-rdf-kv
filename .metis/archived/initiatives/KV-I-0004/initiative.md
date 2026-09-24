@@ -4,14 +4,14 @@ level: initiative
 title: "Memory budget"
 short_code: "KV-I-0004"
 created_at: 2026-09-24T18:29:10.325375+00:00
-updated_at: 2026-09-24T19:00:03.192731+00:00
+updated_at: 2026-09-24T22:39:09.850232+00:00
 parent: KV-V-0001
 blocked_by: []
-archived: false
+archived: true
 
 tags:
   - "#initiative"
-  - "#phase/active"
+  - "#phase/completed"
 
 
 exit_criteria_met: false

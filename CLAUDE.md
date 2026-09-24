@@ -14,9 +14,9 @@ Metis (`.metis/`) is the system of record for plans, decisions and progress. Sta
 
 `metis list` shows everything. `metis.db` is gitignored runtime state; after a fresh clone, run `metis sync` to rebuild it from the markdown.
 
-- `.metis/initiatives/KV-I-0004/initiative.md`: step 6, the memory budget (all six tasks, KV-T-0019 to KV-T-0024, done; the initiative awaits the owner's review before it is completed and archived). Its **Results** section has the exit-criteria evidence, the success criterion per platform, the capacity-planning table per store, the measurements, the deviations and the known limitations. Decisions D1, D8, D9 and D10 carry dated amendments; read those, not only the first text.
+- `.metis/archived/initiatives/KV-I-0004/initiative.md`: step 6, the memory budget (completed and archived; tasks KV-T-0019 to KV-T-0024). Its **Results** section has the exit-criteria evidence, the success criterion per platform, the capacity-planning table per store, the measurements, the deviations and the known limitations. Decisions D1, D8, D9 and D10 carry dated amendments; read those, not only the first text.
 
-**Next up:** the owner's review of KV-I-0004, then step 7 (crash tests and fuzzing), whose cut points include "killed after a spill, before commit".
+**Next up:** step 7 (crash tests and fuzzing), whose cut points include "killed after a spill, before commit".
 
 ## Memory budget in one paragraph
 
