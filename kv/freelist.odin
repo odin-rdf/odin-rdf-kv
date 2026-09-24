@@ -113,9 +113,13 @@ intact (see KV-I-0002 D1).
 Returns `Corrupted` if the list breaks any rule: a run header that doesn't
 match, records out of order, tagged after `snap`, outside [2, last_pgno] or
 inside the run itself, or the same page listed twice.
+
+The run is read from `env`'s map, and its chunks are accounted as read. The
+state is allocated with env.allocator.
 */
 @(private)
-freelist_load :: proc(base: [^]byte, page_size: int, snap: Snapshot, allocator := context.allocator) -> (state: Free_State, err: Error) {
+freelist_load :: proc(env: ^Env, snap: Snapshot) -> (state: Free_State, err: Error) {
+	allocator := env.allocator
 	state.ready = make([dynamic]Pgno, allocator)
 	state.pending = make([dynamic]Free_Record, allocator)
 	defer if err != .None {
@@ -124,10 +128,11 @@ freelist_load :: proc(base: [^]byte, page_size: int, snap: Snapshot, allocator :
 	if snap.freelist_pgno == 0 {
 		return state, .None if snap.freelist_count == 0 else .Corrupted
 	}
-	records, run_pages, ok := freelist_run(base, page_size, snap)
+	records, run_pages, ok := freelist_run(env.map_base, env.page_size, snap)
 	if !ok {
 		return state, .Corrupted
 	}
+	chunks_touch_range(env, int(snap.freelist_pgno) * env.page_size, run_pages * env.page_size)
 
 	run_end := snap.freelist_pgno + Pgno(run_pages)
 	n_ready := 0

@@ -14,23 +14,28 @@ FILE_GROWTH_MIN :: 1 << 20
 // limits how large the database can grow; it isn't memory in use.
 DEFAULT_MAP_SIZE :: 1 << 30
 
-// The map size is rounded up to a multiple of this, which covers every valid
-// page size and the OS page size on all supported platforms.
-MAP_SIZE_GRANULE :: 64 * 1024
-
 Options :: struct {
 	// Bytes of address space to reserve; 0 means DEFAULT_MAP_SIZE. It is
-	// enlarged if the existing file is bigger.
-	map_size:     int,
+	// enlarged if the existing file is bigger, and rounded up to whole
+	// chunks.
+	map_size:      int,
 	// Page size for a new database; 0 means DEFAULT_PAGE_SIZE. An existing
 	// database keeps the page size it was created with.
-	page_size:    int,
+	page_size:     int,
 	// Bytes of memory for a write transaction's dirty pages (KV-I-0004 D1);
 	// 0 means DEFAULT_DIRTY_BUDGET. Rounded up to whole pages, and at least
 	// MIN_DIRTY_PAGES of them. It is address space until a write
 	// transaction uses it, and released when that transaction ends. A
 	// transaction that writes more spills pages to the file early.
-	dirty_budget: int,
+	dirty_budget:  int,
+	// Bytes of the map that may stay resident (KV-I-0004 D7, D8); 0 means
+	// no budget: the resident estimate is still kept and reported, and
+	// nothing is evicted.
+	mapped_budget: int,
+	// The unit the resident estimate counts in, in bytes (KV-I-0004 D7); 0
+	// means DEFAULT_CHUNK_SIZE. A power of two, at least MIN_CHUNK_SIZE
+	// (which is at least every page size).
+	chunk_size:    int,
 }
 
 // The committed state that a transaction starts from.
@@ -61,12 +66,12 @@ Figures about an Env, as returned by env_stats. They are read together
 under one lock, so they describe one instant, but they can be stale as
 soon as env_stats returns. A write transaction in progress shows in none of
 them until it commits, except the dirty-pool figures (dirty_pages,
-dirty_committed, spills), which are live: read atomically while it runs,
-and not necessarily at the same instant as the rest.
+dirty_committed, spills) and the resident estimate (resident_chunks,
+chunk_faults), which are live: read atomically while it runs, and not
+necessarily at the same instant as the rest.
 
-Step 6 (the memory budget) extends this further with the resident
-estimate, spills and evictions; code that builds a Stats should name its
-fields.
+Step 6 (the memory budget) extends this further with evictions; code that
+builds a Stats should name its fields.
 */
 Stats :: struct {
 	// The last page of the latest committed snapshot.
@@ -97,6 +102,22 @@ Stats :: struct {
 	// the Env was opened (KV-I-0004 D3). Overflow runs and the free-list
 	// run, which are always written directly, aren't counted. Live.
 	spills:          int,
+	// Options.mapped_budget, in bytes; 0 for none.
+	mapped_budget:   int,
+	// The chunk size, in bytes.
+	chunk_size:      int,
+	// The resident estimate: chunks of the map read since they were last
+	// evicted (KV-I-0004 D7). Multiply by chunk_size for bytes. An estimate:
+	// pages read through a slice held across an eviction aren't counted.
+	// Live.
+	resident_chunks: int,
+	// Chunks that became resident, since the Env was opened: the rate at
+	// which reads fault chunks in. Equal to resident_chunks until something
+	// is evicted. Live.
+	chunk_faults:    int,
+	// Bytes of memory the free list of the last commit (Env.free) holds.
+	// Not part of any budget.
+	free_list_bytes: int,
 }
 
 Env :: struct {
@@ -121,8 +142,10 @@ Env :: struct {
 	// The memory dirty pages live in (see pool.odin). Owned by the writer,
 	// like `free`.
 	pool:           Dirty_Pool,
-	// The writer's figures for env_stats: file_pages, free_ready and
-	// free_pending, copied from file_size and `free` whenever the writer
+	// The resident estimate of the map (see chunks.odin).
+	chunks:         Chunk_Table,
+	// The writer's figures for env_stats: file_pages, free_ready,
+	// free_pending and free_list_bytes, copied from file_size and `free` whenever the writer
 	// changes those. Guarded by snapshot_mutex, so env_stats never waits
 	// for a write transaction to end. The other fields are unused.
 	stats:          Stats,
@@ -133,7 +156,8 @@ Env :: struct {
 }
 
 // Opens the database at `path`, creating it if the file doesn't exist or is
-// empty. The file stays exclusively locked until env_close.
+// empty. The file stays exclusively locked until env_close. Returns
+// Invalid_Argument for an option out of range.
 env_open :: proc(path: string, options := Options{}, allocator := context.allocator) -> (env: ^Env, err: Error) {
 	page_size := options.page_size if options.page_size != 0 else DEFAULT_PAGE_SIZE
 	if !page_size_valid(page_size) {
@@ -141,6 +165,10 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 	}
 	map_size := options.map_size if options.map_size > 0 else DEFAULT_MAP_SIZE
 	dirty_budget := options.dirty_budget if options.dirty_budget != 0 else DEFAULT_DIRTY_BUDGET
+	chunk_size := options.chunk_size if options.chunk_size != 0 else DEFAULT_CHUNK_SIZE
+	if !chunk_size_valid(chunk_size) || options.mapped_budget < 0 {
+		return nil, .Invalid_Argument
+	}
 
 	fd := os_open(path, create = true) or_return
 	defer if err != .None {
@@ -153,55 +181,62 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 		file_size = 2 * i64(page_size)
 	}
 
-	// The map must cover the whole file.
-	map_size = mem.align_forward_int(max(map_size, int(file_size)), MAP_SIZE_GRANULE)
+	// The map must cover the whole file, in whole chunks. A chunk is a
+	// multiple of every page size and of the OS page size.
+	map_size = mem.align_forward_int(max(map_size, int(file_size)), chunk_size)
 	base := os_map_reserve(fd, map_size) or_return
 	defer if err != .None {
 		os_unmap(base, map_size)
 	}
 	os_advise_random(base, map_size) or_return
 
+	// Built before anything is read from the map, so that those reads are
+	// accounted like any other.
+	e, _ := new(Env, allocator)
+	if e == nil {
+		return nil, .Out_Of_Memory
+	}
+	defer if err != .None {
+		free(e, allocator)
+	}
+	e.fd = fd
+	e.map_base = base
+	e.map_size = map_size
+	e.file_size = file_size
+	e.allocator = allocator
+	chunks_init(&e.chunks, map_size, chunk_size, options.mapped_budget, allocator) or_return
+	defer if err != .None {
+		chunks_destroy(&e.chunks, allocator)
+	}
+
 	meta, meta_page_size, found := meta_choose(base[:file_size])
 	if !found {
 		return nil, .Corrupted
 	}
-	snapshot := snapshot_from_meta(meta)
-	free_state := freelist_load(base, meta_page_size, snapshot, allocator) or_return
+	// Both meta pages, at whatever page size meta_choose tried, are in
+	// chunk 0.
+	chunk_touch(e, 0)
+	e.page_size = meta_page_size
+	e.snapshot = snapshot_from_meta(meta)
+	e.free = freelist_load(e, e.snapshot) or_return
 	defer if err != .None {
-		free_state_destroy(&free_state)
+		free_state_destroy(&e.free)
 	}
 
 	// Checked against the page size the database has, not the one asked for.
-	pool: Dirty_Pool
-	pool_init(&pool, dirty_budget, meta_page_size, allocator) or_return
+	pool_init(&e.pool, dirty_budget, meta_page_size, allocator) or_return
 	defer if err != .None {
-		pool_destroy(&pool, allocator)
+		pool_destroy(&e.pool, allocator)
 	}
 
-	readers, readers_err := make([dynamic]Reader_Slot, 0, READER_TABLE_CAPACITY, allocator)
+	readers_err: mem.Allocator_Error
+	e.readers, readers_err = make([dynamic]Reader_Slot, 0, READER_TABLE_CAPACITY, allocator)
 	if readers_err != nil {
 		return nil, .Out_Of_Memory
 	}
-	env, _ = new(Env, allocator)
-	if env == nil {
-		delete(readers)
-		return nil, .Out_Of_Memory
-	}
-	env^ = Env {
-		fd        = fd,
-		map_base  = base,
-		map_size  = map_size,
-		page_size = meta_page_size,
-		file_size = file_size,
-		snapshot  = snapshot,
-		readers   = readers,
-		free      = free_state,
-		pool      = pool,
-		allocator = allocator,
-	}
-	env.stats.file_pages = int(file_size) / meta_page_size
-	stats_update_free(env)
-	return env, .None
+	e.stats.file_pages = int(file_size) / meta_page_size
+	stats_update_free(e)
+	return e, .None
 }
 
 // Unmaps the database and closes the file, releasing its lock. All
@@ -216,6 +251,7 @@ env_close :: proc(env: ^Env) {
 	delete(env.readers)
 	free_state_destroy(&env.free)
 	pool_destroy(&env.pool, env.allocator)
+	chunks_destroy(&env.chunks, env.allocator)
 	free(env, env.allocator)
 }
 
@@ -232,7 +268,8 @@ thread, including one with a transaction open: it only takes snapshot_mutex,
 briefly, and never waits for a write transaction to end. The free-page
 counts are those of the last commit, plus any release done since by a
 beginning write transaction; a write transaction in progress doesn't change
-them until it commits. The dirty-pool figures are live.
+them until it commits. The dirty-pool figures and the resident estimate are
+live.
 */
 env_stats :: proc(env: ^Env) -> Stats {
 	sync.mutex_lock(&env.snapshot_mutex)
@@ -247,6 +284,10 @@ env_stats :: proc(env: ^Env) -> Stats {
 	stats.dirty_pages = sync.atomic_load(&env.pool.in_use)
 	stats.dirty_committed = sync.atomic_load(&env.pool.committed_bytes)
 	stats.spills = sync.atomic_load(&env.pool.spills)
+	stats.mapped_budget = env.chunks.budget
+	stats.chunk_size = env.chunks.size
+	stats.resident_chunks = sync.atomic_load(&env.chunks.resident)
+	stats.chunk_faults = sync.atomic_load(&env.chunks.faults)
 	return stats
 }
 
@@ -278,9 +319,17 @@ file_grow :: proc(env: ^Env, needed: i64) -> Error {
 @(private)
 stats_update_free :: proc(env: ^Env) {
 	sync.mutex_lock(&env.snapshot_mutex)
+	stats_set_free(env)
+	sync.mutex_unlock(&env.snapshot_mutex)
+}
+
+// Copies the sizes of Env.free into Env.stats. The caller holds
+// writer_mutex (or is env_open) and snapshot_mutex.
+@(private)
+stats_set_free :: proc(env: ^Env) {
 	env.stats.free_ready = len(env.free.ready)
 	env.stats.free_pending = len(env.free.pending)
-	sync.mutex_unlock(&env.snapshot_mutex)
+	env.stats.free_list_bytes = cap(env.free.ready) * size_of(Pgno) + cap(env.free.pending) * size_of(Free_Record)
 }
 
 // Returns the oldest snapshot held by a live read transaction, or false if

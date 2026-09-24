@@ -297,7 +297,7 @@ test_env_map_covers_file :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, kv.Error.None)
 	if err == .None {
 		testing.expect(t, env.map_size >= 1 << 20, "map does not cover the file")
-		testing.expect_value(t, env.map_size % kv.MAP_SIZE_GRANULE, 0)
+		testing.expect_value(t, env.map_size % kv.DEFAULT_CHUNK_SIZE, 0)
 		kv.env_close(env)
 	}
 }

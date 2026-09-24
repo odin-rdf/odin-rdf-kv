@@ -44,6 +44,7 @@ space_check :: proc(txn: ^Txn, allocator := context.temp_allocator) -> (ok: bool
 		if !run_ok {
 			return false, "bad free-list run"
 		}
+		chunks_touch_range(txn.env, int(snap.freelist_pgno) * txn.env.page_size, pages * txn.env.page_size)
 		for i in 0 ..< pages {
 			if mark_ok, mark_reason := mark_free(&c, snap.freelist_pgno + Pgno(i)); !mark_ok {
 				return false, mark_reason

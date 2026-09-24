@@ -116,8 +116,7 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 	env.free = next
 	sync.mutex_lock(&env.snapshot_mutex)
 	env.snapshot = snap^
-	env.stats.free_ready = len(next.ready)
-	env.stats.free_pending = len(next.pending)
+	stats_set_free(env)
 	sync.mutex_unlock(&env.snapshot_mutex)
 	return .None
 }

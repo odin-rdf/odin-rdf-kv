@@ -231,7 +231,7 @@ test_overflow_map_full :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, DB)
 
-	env, txn, ok := open_write(t, temp_dir_file(dir, DB), kv.Options{map_size = 64 * 1024})
+	env, txn, ok := open_write(t, temp_dir_file(dir, DB), kv.Options{map_size = 64 * 1024, chunk_size = kv.MIN_CHUNK_SIZE})
 	if !ok {
 		return
 	}

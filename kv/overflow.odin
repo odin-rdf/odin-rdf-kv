@@ -70,8 +70,11 @@ overflow_value :: proc(txn: ^Txn, pgno: Pgno, val_len: int) -> (value: []byte, e
 	count := overflow_check(txn, pgno, val_len) or_return
 	start := PAGE_HEADER_SIZE
 	// A run is never in the pool: overflow_write writes it to the file.
+	// Every chunk of it is accounted as read, since the caller may read
+	// all of it.
 	ps := txn.env.page_size
 	off := int(pgno) * ps
+	chunks_touch_range(txn.env, off, count * ps)
 	run := txn.env.map_base[off:off + count * ps]
 	return run[start:start + val_len], .None
 }

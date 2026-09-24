@@ -336,7 +336,7 @@ test_map_full_leaves_txn_usable :: proc(t: ^testing.T) {
 	defer temp_dir_destroy(&dir, DB)
 
 	// 64 KiB: 16 pages of 4 KiB, two of them meta pages.
-	env, txn, ok := open_write(t, temp_dir_file(dir, DB), kv.Options{map_size = 64 * 1024})
+	env, txn, ok := open_write(t, temp_dir_file(dir, DB), kv.Options{map_size = 64 * 1024, chunk_size = kv.MIN_CHUNK_SIZE})
 	if !ok {
 		return
 	}

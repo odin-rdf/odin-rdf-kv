@@ -208,7 +208,8 @@ write_state_free :: proc(txn: ^Txn) {
 // Returns page `pgno` as seen by the transaction: this transaction's copy in
 // the pool if it holds the page dirty, otherwise the page in the map (a
 // committed page, or one this transaction spilled). This is the only way the
-// rest of the package reaches a page.
+// rest of the package reaches a page. A page returned from the map has its
+// chunk accounted as read (see chunks.odin); a dirty page counts nothing.
 page_ptr :: #force_inline proc(txn: ^Txn, pgno: Pgno) -> []byte {
 	when ODIN_DEBUG {
 		assert(!txn.done, "transaction already ended")
@@ -220,7 +221,11 @@ page_ptr :: #force_inline proc(txn: ^Txn, pgno: Pgno) -> []byte {
 			return pool_pages(&txn.env.pool, d.slot, 1)
 		}
 	}
-	// The memory budget (step 6) hooks residency accounting in here.
+	// The map's base is read before the accounting, whose slow path is a
+	// call, so that the fast path doesn't read it again after.
+	env := txn.env
+	base := env.map_base
 	off := int(pgno) * ps
-	return txn.env.map_base[off:off + ps]
+	chunk_touch(env, off)
+	return base[off:off + ps]
 }
