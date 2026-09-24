@@ -673,6 +673,26 @@ test_del_abort_and_reopen :: proc(t: ^testing.T) {
 	expect_shape_keys(t, &reader2, N, ..gone[:])
 }
 
+// Whether a reader of `snap` can see page `pgno`: it lies within the
+// snapshot and isn't one of the free pages its free list records. The
+// list's own run counts as seen, as space_check reads it.
+@(private = "file")
+snapshot_has_page :: proc(env: ^kv.Env, snap: kv.Snapshot, pgno: kv.Pgno) -> bool {
+	if pgno < 2 || pgno > snap.last_pgno {
+		return false
+	}
+	if snap.freelist_pgno != 0 {
+		off := int(snap.freelist_pgno) * env.page_size + kv.PAGE_HEADER_SIZE
+		records := ([^]kv.Free_Record)(&env.map_base[off])[:snap.freelist_count]
+		for r in records {
+			if kv.Pgno(r.pgno) == pgno {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // NFR-003: a reader that began before a commit deleting half the keys (some
 // with overflow values) still reads every one of them, however many commits
 // follow; once it ends, the pages it pinned are reused.
@@ -720,8 +740,16 @@ test_del_reader_keeps_snapshot :: proc(t: ^testing.T) {
 			kv.txn_abort(&reader)
 			return
 		}
+		// Pages may be reusable, but none the reader can see: a commit
+		// lists the pages it allocated and dropped again as reusable at
+		// once, and they lie past the reader's snapshot.
+		for pgno in env.free.ready {
+			if snapshot_has_page(env, reader.snapshot, pgno) {
+				testing.expectf(t, false, "round %d: page %d of the reader's snapshot is reusable", round, pgno)
+				break
+			}
+		}
 	}
-	testing.expect_value(t, kv.env_stats(env).free_ready, 0)
 
 	overflow := 0
 	for k in 0 ..< N {
