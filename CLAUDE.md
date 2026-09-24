@@ -16,7 +16,7 @@ Metis (`.metis/`) is the system of record for plans, decisions and progress. Sta
 
 - `.metis/initiatives/KV-I-0004/initiative.md`: step 6, the memory budget (decomposed, tasks KV-T-0019 to KV-T-0024). Its decisions D1–D12 are approved; the first task is a platform measurement whose results can amend D1, D9 and D10.
 
-**Next up:** KV-T-0022, chunk accounting (KV-I-0004 D7, D11). The measurement (KV-T-0019), the dirty-page pool (KV-T-0020) and spilling (KV-T-0021) are done. `Stats` (`env_stats`) is where step 6's figures go.
+**Next up:** KV-T-0024, the OS check (`env_resident_check`) and the success criterion. The measurement (KV-T-0019), the dirty-page pool (KV-T-0020), spilling (KV-T-0021), chunk accounting (KV-T-0022) and eviction (KV-T-0023: at every transaction end, inline at the hard watermark, and `env_sweep` as the sleep path) are done. `Stats` (`env_stats`) is where step 6's figures go.
 
 ## Working agreement
 
@@ -59,7 +59,7 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 | `meta.odin` | Meta page layout and checksum |
 | `env.odin` | Open and close, choosing the meta page, `meta_write`, the reader table, `env_stats`, `file_grow` |
 | `txn.odin` | `Txn` (a value type), `Write_State` (on the heap; `dirty` maps a page number to its pool slots, `spilled` the pages already written to the file), the reuse horizon, `page_ptr` |
-| `chunks.odin` | `Chunk_Table`, the resident estimate of the map (KV-I-0004 D7): one byte per chunk (`resident`, `referenced`), `chunk_touch` (page_ptr's fast path), `chunk_mark` (the CAS), `chunk_resident_added` (KV-T-0023's watermark hook) |
+| `chunks.odin` | `Chunk_Table`, the resident estimate of the map (KV-I-0004 D7): one byte per chunk (`resident`, `referenced`), `chunk_touch` (page_ptr's fast path), `chunk_mark` (the CAS), `chunk_resident_added` (raises `end`, evicts inline at the hard watermark); eviction (D8, D9): `chunks_evict` (CLOCK under `evict_mutex`), `chunks_evict_all` (target 0), `chunks_txn_end` (called by `txn_abort`), `env_sweep` |
 | `pool.odin` | `Dirty_Pool`, the dirty-page pool (KV-I-0004 D1): slots reserved at open, committed on first use, released when the write transaction ends; `pool_make_room` and `spill` (D2–D4: the least recently touched quarter, written in page order) |
 | `tree.odin` | `tree_search`, `get` |
 | `write.odin` | `page_alloc` (loose, then reusable, then the end of the file), `page_take` (the same page numbers without pool slots), `pages_available`, `page_free`, `page_touch` (a spilled page comes back under its own number), `put`, splits |
@@ -69,7 +69,7 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 | `delete.odin` | `del`: removal, the rebalance loop (merge with a sibling, drop empty pages) and root collapse |
 | `cursor.odin` | Cursors |
 | `check.odin` | `tree_check`, and `space_check` (every page owned exactly once) |
-| `os_*.odin` | Platform layer, including the pool's reserve, commit and release (`os_pool_release`: `MAP_FIXED` remap on macOS, `madvise(MADV_DONTNEED)` on Linux) |
+| `os_*.odin` | Platform layer, including the map reserved at a chunk-aligned address, the pool's reserve, commit and release (`os_pool_release`: `MAP_FIXED` remap on macOS, `madvise(MADV_DONTNEED)` on Linux) and eviction of mapped pages (`os_evict`: `MAP_FIXED` remap of the same file range plus `MADV_RANDOM` again on macOS, `madvise(MADV_DONTNEED)` on Linux) |
 
 **Test helpers:**
 - `tests/tree_helpers.odin`: `build_tree_file` builds a packed tree directly; `build_tree_shape` builds any shape, with each leaf's entries and each level's grouping given (underfull pages, single-child branches).
@@ -78,11 +78,13 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 - `tests/freelist_test.odin`: `open_hand_list` opens a database with a hand-written free list.
 - `tests/steady_test.odin`: the steady-state workload (`steady_commit`) and `expect_latest_ok` (`space_check` and `tree_check` on a new reader).
 
-**Other test files:** `delete_test.odin` (delete shapes and semantics; `sized_entries`, `expect_shape_keys`, `commit_ok`), `reader_test.odin` (reader table), `reuse_test.odin` (reuse rules), `steady_test.odin` (`env_stats`; plateau, full map, long reader and insert/delete churn on demand), `isolation_test.odin` (threads, including readers that come and go while pages are reused), `pool_test.odin` (the dirty-page pool: budget, live figures, release checked against the OS), `spill_test.odin` (spilling with the smallest pool: ten times the pool, re-touch and free of spilled pages, abort, readers, a value larger than the pool), `spill_bench_test.odin` (the spill cost, only registered with `-define:KV_BENCH=true`), `chunk_test.odin` (chunk accounting: options, boundaries, dirty reads, overflow runs, `freelist_load`, concurrent readers; `expect_chunks_consistent`), `read_bench_test.odin` (read throughput, only registered with `-define:KV_BENCH=true`), `platform_test.odin` (KV-T-0019's measurement, only registered with `-define:KV_PLATFORM=true`; `platform_residency` is usable by any test), `bench_test.odin` and `fill_test.odin` (the free-list cost and the fill after deletes, only registered with `-define:KV_BENCH=true`).
+**Other test files:** `delete_test.odin` (delete shapes and semantics; `sized_entries`, `expect_shape_keys`, `commit_ok`), `reader_test.odin` (reader table), `reuse_test.odin` (reuse rules), `steady_test.odin` (`env_stats`; plateau, full map, long reader and insert/delete churn on demand), `isolation_test.odin` (threads, including readers that come and go while pages are reused), `pool_test.odin` (the dirty-page pool: budget, live figures, release checked against the OS), `spill_test.odin` (spilling with the smallest pool: ten times the pool, re-touch and free of spilled pages, abort, readers, a value larger than the pool), `spill_bench_test.odin` (the spill cost, only registered with `-define:KV_BENCH=true`), `chunk_test.odin` (chunk accounting: options, boundaries, dirty reads, overflow runs, `freelist_load`, concurrent readers; `expect_chunks_consistent`), `evict_test.odin` (eviction: `env_sweep`'s targets, CLOCK, eviction at transaction ends and inline, held slices, writes across evictions, the budget under threads with no `env_sweep`, requests during a sleep sweep, `try_lock`, the estimate never under the OS's view; `test_bench_sweep` with `-define:KV_BENCH=true`), `read_bench_test.odin` (read throughput, only registered with `-define:KV_BENCH=true`), `platform_test.odin` (KV-T-0019's measurement, only registered with `-define:KV_PLATFORM=true`; `platform_residency` is usable by any test, and so are `chunks_present` (Linux `pagemap`; none on macOS) and `advice_random` (a range's `MADV_RANDOM`) from the per-platform files), `bench_test.odin` and `fill_test.odin` (the free-list cost and the fill after deletes, only registered with `-define:KV_BENCH=true`).
 
 ## Invariants and conventions
 
 - **`page_ptr(txn, pgno)` is the only way to reach a page,** and it accounts the page's chunk as read when the page comes from the map (`chunk_touch`; a dirty page counts nothing). Overflow runs are read through `overflow_value`, which validates the run and accounts every chunk of it. Anything else that reads the map directly must call `chunks_touch_range` (as `freelist_load` and `space_check` do; `env_open` marks chunk 0 for the meta pages). Keep `chunk_touch`'s fast path a shift and one atomic load, with no write when both flags are set.
+- **Eviction** (KV-I-0004 D8, D9): only eviction clears `CHUNK_RESIDENT`, always by CAS **before** the range is evicted, so a racing read can only make the estimate too high. It runs under `evict_mutex`: transaction ends and `env_sweep` take it with `try_lock` (they don't wait), and a read past the hard watermark (B + 2 chunks) **waits** for it, which is what bounds the estimate at about B + 2 plus one chunk per thread under concurrency. So **no code holding `evict_mutex` may reach `page_ptr`** (or `chunk_touch`, `chunks_touch_range`): it would wait on itself. Eviction reads no page; a test that holds the lock to simulate an evictor must hold it from another thread. Every transaction ends in `txn_abort` (`txn_commit` too), which evicts above the budget once it has released the reader table and the writer mutex. Evicting keeps every address valid, so held slices stay valid, but pages they fault back in aren't counted (Q4): a test comparing the estimate with the OS must not read held slices after an eviction.
+- **The map starts at a chunk-aligned address** (`os_map_reserve`'s `align`): Linux fault-around maps a 64 KiB window aligned by *address*, which stays inside one chunk only if the chunks are aligned in the address space. `mmap` alone aligns to the OS page.
 - **Zero-copy lifetimes:**
   - a slice from a read transaction is valid until the transaction ends;
   - a slice from a write transaction is valid until the next `put` or `del`, which may spill the page it points into and reuse its slot;
@@ -111,8 +113,11 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 - `offset_of` returns `uintptr`, so it needs a cast before mixing with `int`.
 - A width on an integer in `fmt` (`%7d`, `%7v`) pads it with zeros. Format the number first, then pad the string (`%7s`).
 - `flock` and `F_FULLFSYNC` aren't in `core:sys/posix`; they're declared locally in `kv/os_*.odin`.
+- `thread.create_and_start_with_poly_data(..., init_context = context)` shares the caller's random generator state between threads: `rand` then races (TSan reports it). Leave `init_context` out, and each thread gets its own.
 
 **Platform:**
+- glibc's `posix_madvise(POSIX_MADV_DONTNEED)` is a no-op; call `madvise` itself (declared in `kv/os_linux.odin`). `posix_madvise` is fine for `RANDOM`.
+- A `MAP_FIXED` remap on macOS makes a new mapping with default advice: give `MADV_RANDOM` again.
 - Apple Silicon OS pages are 16 KiB. A 4 KiB database page just past the end of the file can read as zeros instead of raising SIGBUS, so bounds checks must not rely on a SIGBUS.
 
 **Shell:**

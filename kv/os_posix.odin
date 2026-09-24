@@ -113,12 +113,32 @@ os_pwrite :: proc(fd: posix.FD, buf: []byte, offset: i64) -> Error {
 }
 
 // Reserves `map_size` bytes of address space as a read-only shared mapping
-// of the file. The mapping may extend past the end of the file; only pages
-// inside the file may be touched.
-os_map_reserve :: proc(fd: posix.FD, map_size: int) -> (base: [^]byte, err: Error) {
-	p := posix.mmap(nil, c.size_t(map_size), {.READ}, {.SHARED}, fd, 0)
-	if p == posix.MAP_FAILED {
+// of the file, at an address aligned to `align` (a power of two, a multiple
+// of the OS page size). The mapping may extend past the end of the file;
+// only pages inside the file may be touched. The alignment keeps each chunk
+// of the map (KV-I-0004 D7) aligned in the address space, which Linux's
+// fault-around window (64 KiB, aligned by address; KV-T-0019) needs to
+// stay inside one chunk: mmap alone only aligns to the OS page.
+os_map_reserve :: proc(fd: posix.FD, map_size, align: int) -> (base: [^]byte, err: Error) {
+	// Reserve enough to find an aligned start, map the file over it there,
+	// and give back the slack on either side.
+	span := map_size + align
+	r := posix.mmap(nil, c.size_t(span), {}, {.PRIVATE, .ANONYMOUS}, -1, 0)
+	if r == posix.MAP_FAILED {
 		return nil, .Io
+	}
+	lo := uintptr(r)
+	start := (lo + uintptr(align) - 1) &~ uintptr(align - 1)
+	p := posix.mmap(rawptr(start), c.size_t(map_size), {.READ}, {.SHARED, .FIXED}, fd, 0)
+	if p == posix.MAP_FAILED {
+		posix.munmap(r, c.size_t(span))
+		return nil, .Io
+	}
+	if start > lo {
+		posix.munmap(r, c.size_t(start - lo))
+	}
+	if tail := lo + uintptr(span) - (start + uintptr(map_size)); tail > 0 {
+		posix.munmap(rawptr(start + uintptr(map_size)), c.size_t(tail))
 	}
 	return ([^]byte)(p), .None
 }

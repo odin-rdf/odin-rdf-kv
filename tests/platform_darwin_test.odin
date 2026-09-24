@@ -141,3 +141,55 @@ platform_source_costs :: proc(base: [^]byte, size: int) {
 	}
 	log.infof("task_info(TASK_VM_INFO): %.1f µs per call", time.duration_microseconds(time.tick_since(start)) / 10)
 }
+
+// For eviction tests (KV-T-0023): macOS has no per-range source for what is
+// mapped into the process (KV-T-0019), so this reports none.
+chunks_present :: proc(base: [^]byte, size, chunk: int) -> (present: []bool, ok: bool) {
+	return nil, false
+}
+
+// <mach/vm_region.h>, `vm_region_basic_info_64`. `offset` is a u64 at a
+// 4-byte offset under `#pragma pack(4)`, so it is split in two here.
+@(private = "file")
+VM_REGION_BASIC_INFO_64 :: 9
+
+@(private = "file")
+Vm_Region_Basic_Info_64 :: struct {
+	protection:       i32,
+	max_protection:   i32,
+	inheritance:      u32,
+	shared:           u32,
+	reserved:         u32,
+	offset_lo:        u32,
+	offset_hi:        u32,
+	behavior:         i32,
+	user_wired_count: u16,
+}
+
+#assert(size_of(Vm_Region_Basic_Info_64) == 36)
+
+// <mach/vm_behavior.h>
+@(private = "file")
+VM_BEHAVIOR_RANDOM :: 1
+
+// For eviction tests (KV-T-0023): whether every region starting in the
+// range has MADV_RANDOM advice (VM_BEHAVIOR_RANDOM). A remap by eviction
+// makes a region of its own, with default advice until it is given again.
+advice_random :: proc(base: [^]byte, size: int) -> (random: bool, ok: bool) {
+	addr := u64(uintptr(base))
+	end := addr + u64(size)
+	random = true
+	for addr < end {
+		region_size: u64
+		info: Vm_Region_Basic_Info_64
+		count := u32(size_of(Vm_Region_Basic_Info_64) / 4)
+		object: darwin.mach_port_t
+		if mach_vm_region(darwin.mach_task_self(), &addr, &region_size, VM_REGION_BASIC_INFO_64, &info, &count, &object) != .Success || addr >= end {
+			break
+		}
+		ok = true
+		random &= info.behavior == VM_BEHAVIOR_RANDOM
+		addr += region_size
+	}
+	return random && ok, ok
+}

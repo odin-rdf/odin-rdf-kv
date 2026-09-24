@@ -67,57 +67,69 @@ under one lock, so they describe one instant, but they can be stale as
 soon as env_stats returns. A write transaction in progress shows in none of
 them until it commits, except the dirty-pool figures (dirty_pages,
 dirty_committed, spills) and the resident estimate (resident_chunks,
-chunk_faults), which are live: read atomically while it runs, and not
+chunk_faults and the eviction counts), which are live: read atomically while it runs, and not
 necessarily at the same instant as the rest.
 
-Step 6 (the memory budget) extends this further with evictions; code that
-builds a Stats should name its fields.
+Code that builds a Stats should name its fields.
 */
 Stats :: struct {
 	// The last page of the latest committed snapshot.
-	last_pgno:       Pgno,
+	last_pgno:         Pgno,
 	// Pages in the file. The file grows ahead of last_pgno in steps (see
 	// FILE_GROWTH_MIN), and never shrinks.
-	file_pages:      int,
+	file_pages:        int,
 	// Free pages that a write transaction beginning now may reuse. The
 	// release at txn_begin moves pending pages here, so after readers end
 	// this count only catches up when the next write transaction begins.
-	free_ready:      int,
+	free_ready:        int,
 	// Free pages still waiting for older snapshots to end (KV-I-0002 REQ-002).
-	free_pending:    int,
+	free_pending:      int,
 	// Live read transactions.
-	readers:         int,
+	readers:           int,
 	// The oldest snapshot a live read transaction holds, or 0 if none does.
-	oldest_reader:   Txn_Id,
+	oldest_reader:     Txn_Id,
 	// The dirty-page pool's size in bytes (Options.dirty_budget, rounded).
-	dirty_budget:    int,
+	dirty_budget:      int,
 	// Pool slots (pages) in use by the current write transaction; 0 when
 	// none is open. Live.
-	dirty_pages:     int,
+	dirty_pages:       int,
 	// Bytes of the pool committed (backed by memory); 0 when no write
 	// transaction is open. Commits are in whole OS pages, so with pages
 	// smaller than the OS's this can exceed dirty_pages' bytes. Live.
-	dirty_committed: int,
+	dirty_committed:   int,
 	// Pages spilled from the pool to the file before their commit, since
 	// the Env was opened (KV-I-0004 D3). Overflow runs and the free-list
 	// run, which are always written directly, aren't counted. Live.
-	spills:          int,
+	spills:            int,
 	// Options.mapped_budget, in bytes; 0 for none.
-	mapped_budget:   int,
+	mapped_budget:     int,
 	// The chunk size, in bytes.
-	chunk_size:      int,
+	chunk_size:        int,
 	// The resident estimate: chunks of the map read since they were last
 	// evicted (KV-I-0004 D7). Multiply by chunk_size for bytes. An estimate:
 	// pages read through a slice held across an eviction aren't counted.
 	// Live.
-	resident_chunks: int,
+	resident_chunks:   int,
 	// Chunks that became resident, since the Env was opened: the rate at
-	// which reads fault chunks in. Equal to resident_chunks until something
-	// is evicted. Live.
-	chunk_faults:    int,
+	// which reads fault chunks in. chunk_faults − evictions =
+	// resident_chunks. Live.
+	chunk_faults:      int,
+	// Chunks evicted, since the Env was opened (KV-I-0004 D8, D9). Live.
+	evictions:         int,
+	// Calls to env_sweep that evicted something, since the Env was opened.
+	// Live.
+	sweeps:            int,
+	// Transaction ends that evicted something, since the Env was opened:
+	// the path that keeps a store in use within its budget. Live.
+	txn_end_evictions: int,
+	// Inline evictions, since the Env was opened: reads that took the
+	// estimate past the hard watermark (the budget plus two chunks) and
+	// evicted down to the low watermark. Many of them against few
+	// transaction ends means transactions read far past the budget. Live.
+	inline_evictions:  int,
 	// Bytes of memory the free list of the last commit (Env.free) holds.
 	// Not part of any budget.
-	free_list_bytes: int,
+	free_list_bytes:   int,
 }
 
 Env :: struct {
@@ -184,7 +196,7 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 	// The map must cover the whole file, in whole chunks. A chunk is a
 	// multiple of every page size and of the OS page size.
 	map_size = mem.align_forward_int(max(map_size, int(file_size)), chunk_size)
-	base := os_map_reserve(fd, map_size) or_return
+	base := os_map_reserve(fd, map_size, chunk_size) or_return
 	defer if err != .None {
 		os_unmap(base, map_size)
 	}
@@ -288,6 +300,10 @@ env_stats :: proc(env: ^Env) -> Stats {
 	stats.chunk_size = env.chunks.size
 	stats.resident_chunks = sync.atomic_load(&env.chunks.resident)
 	stats.chunk_faults = sync.atomic_load(&env.chunks.faults)
+	stats.evictions = sync.atomic_load(&env.chunks.evictions)
+	stats.sweeps = sync.atomic_load(&env.chunks.sweeps)
+	stats.txn_end_evictions = sync.atomic_load(&env.chunks.txn_end_evictions)
+	stats.inline_evictions = sync.atomic_load(&env.chunks.inline_evictions)
 	return stats
 }
 

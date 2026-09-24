@@ -30,13 +30,13 @@ chunks_with :: proc(env: ^kv.Env, flags: u8) -> []int {
 }
 
 // Checks that the resident count is the number of chunks flagged resident,
-// that every resident chunk is inside the file, and that chunk_faults equals
-// the count (nothing is evicted yet), in env_stats as well.
+// that every resident chunk is inside the file, and that chunk_faults less
+// evictions is the count, in env_stats as well.
 expect_chunks_consistent :: proc(t: ^testing.T, env: ^kv.Env, loc := #caller_location) -> bool {
 	resident := chunks_with(env, kv.CHUNK_RESIDENT)
 	s := kv.env_stats(env)
 	ok := testing.expect_value(t, s.resident_chunks, len(resident), loc = loc)
-	ok &= testing.expect_value(t, s.chunk_faults, s.resident_chunks, loc = loc)
+	ok &= testing.expect_value(t, s.chunk_faults - s.evictions, s.resident_chunks, loc = loc)
 	ok &= testing.expect_value(t, s.chunk_size, env.chunks.size, loc = loc)
 	for i in resident {
 		ok &= testing.expectf(t, i64(i) * i64(env.chunks.size) < env.file_size, "chunk %d past the end of the file is resident", i, loc = loc)
@@ -120,6 +120,7 @@ test_chunk_options :: proc(t: ^testing.T) {
 		testing.expect_value(t, s.mapped_budget, 20 << 20)
 		testing.expect_value(t, env.map_size, max(size, 128 * 1024))
 		testing.expect_value(t, env.map_size % size, 0)
+		testing.expect_value(t, int(uintptr(env.map_base)) % size, 0)
 		expect_resident(t, env, {0})
 		kv.env_close(env)
 	}

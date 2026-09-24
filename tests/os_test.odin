@@ -27,8 +27,9 @@ test_pwrite_visible_through_map :: proc(t: ^testing.T) {
 	defer kv.os_close(fd)
 
 	testing.expect_value(t, kv.os_truncate(fd, 2 * PAGE), kv.Error.None)
-	base, map_err := kv.os_map_reserve(fd, MAP_SIZE)
+	base, map_err := kv.os_map_reserve(fd, MAP_SIZE, kv.MIN_CHUNK_SIZE)
 	testing.expect_value(t, map_err, kv.Error.None)
+	testing.expect_value(t, uintptr(base) % kv.MIN_CHUNK_SIZE, 0)
 	defer kv.os_unmap(base, MAP_SIZE)
 	testing.expect_value(t, kv.os_advise_random(base, MAP_SIZE), kv.Error.None)
 

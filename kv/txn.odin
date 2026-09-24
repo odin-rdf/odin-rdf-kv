@@ -177,7 +177,9 @@ reuse_horizon :: proc(env: ^Env, s: Txn_Id) -> Txn_Id {
 }
 
 // Ends the transaction, discarding any changes. Safe to call more than once,
-// and after txn_commit.
+// and after txn_commit. Every transaction ends here (txn_commit too), so this
+// is also where the store evicts mapped pages when it is over its budget
+// (see chunks_txn_end).
 txn_abort :: proc(txn: ^Txn) {
 	if txn.done || txn.env == nil {
 		return
@@ -193,6 +195,9 @@ txn_abort :: proc(txn: ^Txn) {
 		reader_deregister(txn.env, txn.snapshot.txn_id)
 		sync.mutex_unlock(&txn.env.snapshot_mutex)
 	}
+	// With nothing held any more, so that eviction holds up neither the
+	// writer nor the reader table (KV-I-0004 D8).
+	chunks_txn_end(txn.env)
 	sync.atomic_sub(&txn.env.active_txns, 1)
 }
 

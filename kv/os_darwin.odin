@@ -34,3 +34,22 @@ os_pool_release :: proc(addr: rawptr, size: int) -> Error {
 	}
 	return .None
 }
+
+// Evicts `size` bytes of the map at `addr`, which is at byte `offset` of the
+// file: its pages leave the process, stay in the page cache, and are read
+// back from there when next touched. The addresses stay valid throughout,
+// including for other threads reading the range. Mapping the same file
+// range over itself with MAP_FIXED is the only call that does this on
+// macOS: MADV_DONTNEED is a hint there that drops nothing, and
+// msync(MS_INVALIDATE) drops the page cache too (measured in KV-T-0019).
+// The new mapping has default advice, so MADV_RANDOM is given again.
+os_evict :: proc(fd: posix.FD, addr: [^]byte, offset, size: int) -> Error {
+	p := posix.mmap(addr, c.size_t(size), {.READ}, {.SHARED, .FIXED}, fd, posix.off_t(offset))
+	if p == posix.MAP_FAILED {
+		return .Io
+	}
+	if posix.posix_madvise(addr, c.size_t(size), .RANDOM) != .NONE {
+		return .Io
+	}
+	return .None
+}

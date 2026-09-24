@@ -147,3 +147,43 @@ platform_source_costs :: proc(base: [^]byte, size: int) {
 	}
 	log.infof("statm: %.1f µs per call", time.duration_microseconds(time.tick_since(start)) / 10)
 }
+
+// For eviction tests (KV-T-0023): whether each `chunk`-byte chunk of the
+// range has any page present in the process's page tables, from
+// /proc/self/pagemap (temp allocator). ok is false where the platform has no
+// such source.
+chunks_present :: proc(base: [^]byte, size, chunk: int) -> (present: []bool, ok: bool) {
+	present = make([]bool, size / chunk, context.temp_allocator)
+	for &p, i in present {
+		n := pagemap_present(base[i * chunk:], chunk)
+		if n < 0 {
+			return nil, false
+		}
+		p = n > 0
+	}
+	return present, true
+}
+
+// For eviction tests (KV-T-0023): whether every mapping starting in the
+// range has MADV_RANDOM advice ("rr" in its /proc/self/smaps VmFlags).
+advice_random :: proc(base: [^]byte, size: int) -> (random: bool, ok: bool) {
+	lo, hi := uintptr(base), uintptr(base) + uintptr(size)
+	text := read_proc("/proc/self/smaps")
+	inside := false
+	random = true
+	for line in strings.split_lines_iterator(&text) {
+		dash := strings.index_byte(line, '-')
+		space := strings.index_byte(line, ' ')
+		if dash > 0 && space > dash {
+			if start, parse_ok := strconv.parse_uint(line[:dash], 16); parse_ok {
+				inside = uintptr(start) >= lo && uintptr(start) < hi
+				continue
+			}
+		}
+		if inside && strings.has_prefix(line, "VmFlags:") {
+			ok = true
+			random &= strings.contains(line, " rr")
+		}
+	}
+	return random && ok, ok
+}

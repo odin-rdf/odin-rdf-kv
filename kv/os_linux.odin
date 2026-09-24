@@ -36,3 +36,17 @@ os_pool_release :: proc(addr: rawptr, size: int) -> Error {
 	}
 	return .None
 }
+
+// Evicts `size` bytes of the map at `addr`: its pages leave the process,
+// stay in the page cache, and are read back from there when next touched.
+// The addresses stay valid throughout, including for other threads reading
+// the range. MADV_DONTNEED drops a shared file mapping's page table entries
+// and keeps its advice; madvise is called directly, since glibc's
+// posix_madvise ignores it (measured in KV-T-0019). `fd` and `offset` are
+// for macOS's method.
+os_evict :: proc(fd: posix.FD, addr: [^]byte, offset, size: int) -> Error {
+	if madvise(addr, c.size_t(size), MADV_DONTNEED) != 0 {
+		return .Io
+	}
+	return .None
+}
