@@ -4,14 +4,14 @@ level: initiative
 title: "Page reuse: free list and reader table"
 short_code: "KV-I-0002"
 created_at: 2026-09-24T09:58:51.754782+00:00
-updated_at: 2026-09-24T11:25:55.358165+00:00
+updated_at: 2026-09-24T15:30:14.848164+00:00
 parent: KV-V-0001
 blocked_by: []
-archived: false
+archived: true
 
 tags:
   - "#initiative"
-  - "#phase/active"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
