@@ -349,16 +349,15 @@ A long-lived reader pins every page freed while it is held, so the file
 grows. Once it ends, a further 10³ commits reuse those pages: no put
 extends the file.
 
-Two things differ from what KV-T-0013 asked for, both recorded there:
-- The pinned pages stay on the free list (the file never shrinks), so the
-  list holds thousands of records and its own run is about 30 pages, which
-  commit must place in a free run of exactly that length. Once
-  lowest-first allocation has broken up the low runs, placement extends
-  the file instead, now and then (0–3 times in 1,000 commits over 16
-  seeds). That growth is allowed here, up to five runs, and must come from
-  the run alone.
-- free_ready stays level rather than falling: each commit frees about as
-  many pages as it takes. It is logged.
+The pinned pages stay on the free list (the file never shrinks), so the
+list holds thousands of records and its own run is about 30 pages. Until
+KV-T-0014 that run had to be exactly as long as its records needed, and
+now and then no length fit, so placement extended the file (0–3 times in
+1,000 commits over 16 seeds). With a page of slack allowed, the file
+doesn't grow at all.
+
+free_ready stays level rather than falling, as KV-T-0013 recorded: each
+commit frees about as many pages as it takes. It is logged.
 */
 @(test)
 test_steady_state_long_reader :: proc(t: ^testing.T) {
@@ -416,7 +415,7 @@ test_steady_state_long_reader :: proc(t: ^testing.T) {
 	// Nothing is released until a write transaction begins.
 	testing.expect_value(t, ended.free_pending, held.free_pending)
 	snap := kv.env_snapshot(env)
-	run_pages := kv.freelist_run_pages(env.page_size, int(snap.freelist_count))
+	run_pages := freelist_run_len(t, env, snap)
 
 	written := make([dynamic]kv.Pgno, context.temp_allocator)
 	put_growth, reused := 0, 0
@@ -444,7 +443,7 @@ test_steady_state_long_reader :: proc(t: ^testing.T) {
 	log.infof("[seed %d] last_pgno %d before the reader, %d while held (%d pending, a run of %d pages); after 1,000 more commits %d, of which %d from puts; %d pages reused; free_ready every 100 commits %v",
 		t.seed, before.last_pgno, held.last_pgno, held.free_pending, run_pages, s.last_pgno, put_growth, reused, ready)
 	testing.expectf(t, put_growth == 0, "puts added %d pages after the reader ended", put_growth)
-	testing.expectf(t, growth <= 5 * (run_pages + 2), "the file grew by %d pages after the reader ended, more than five free-list runs of %d", growth, run_pages)
+	testing.expectf(t, growth == 0, "the file grew by %d pages after the reader ended (free-list run of %d pages)", growth, run_pages)
 	testing.expect(t, reused > 5_000, "too few pages reused")
 	latest, _ := kv.txn_begin(env)
 	defer kv.txn_abort(&latest)

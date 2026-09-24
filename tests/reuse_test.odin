@@ -111,14 +111,14 @@ all_in :: proc(pages, set: []kv.Pgno) -> bool {
 	return true
 }
 
-// The pages of the free-list run of `snap`, read from the committed meta
-// fields (temp allocator).
+// The pages of the free-list run of `snap`, from the committed meta fields
+// and the run's header (temp allocator).
 @(private = "file")
 run_pages_of :: proc(t: ^testing.T, env: ^kv.Env, snap: kv.Snapshot) -> []kv.Pgno {
 	if snap.freelist_pgno == 0 {
 		return nil
 	}
-	pages := make([]kv.Pgno, kv.freelist_run_pages(env.page_size, int(snap.freelist_count)), context.temp_allocator)
+	pages := make([]kv.Pgno, freelist_run_len(t, env, snap), context.temp_allocator)
 	for &p, i in pages {
 		p = snap.freelist_pgno + kv.Pgno(i)
 	}

@@ -64,16 +64,18 @@ overflow_check :: proc(txn: ^Txn, pgno: Pgno, val_len: int) -> (count: int, err:
 
 // Checks the header on `first`, the first page of a run at `pgno` holding
 // `size` bytes after its header: it records its own page number and exactly
-// `flags`, and has exactly the pages `size` needs, all within `last`. Returns
-// the run's length in pages. Shared by overflow runs and the free-list run.
+// `flags`, and has the pages `size` needs plus at most `slack` more, all
+// within `last`. Returns the run's length in pages. Shared by overflow runs
+// (no slack) and the free-list run (see freelist_place).
 @(private)
-run_header_check :: proc(first: []byte, pgno, last: Pgno, flags: u16, size: int) -> (count: int, ok: bool) {
+run_header_check :: proc(first: []byte, pgno, last: Pgno, flags: u16, size: int, slack := 0) -> (count: int, ok: bool) {
 	h := page_header(first)
 	if Pgno(h.pgno) != pgno || u16(h.flags) != flags {
 		return 0, false
 	}
 	count = int(h.overflow_count)
-	if count != overflow_pages(len(first), size) || int(pgno) + count - 1 > int(last) {
+	needed := overflow_pages(len(first), size)
+	if count < needed || count > needed + slack || int(pgno) + count - 1 > int(last) {
 		return 0, false
 	}
 	return count, true

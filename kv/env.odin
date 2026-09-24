@@ -375,8 +375,9 @@ meta_read :: proc(file: []byte, slot: int, page_size: int) -> (meta: Meta, ok: b
 	if meta.last_pgno < 1 || meta.root > meta.last_pgno || (meta.root == 0) != (meta.depth == 0) {
 		return {}, false
 	}
-	// The free-list run too. Bounding the count by the file first keeps the
-	// size computation from overflowing; the list itself is checked when it
+	// The free-list run too, at the least length its records need. Bounding
+	// the count by the file first keeps the size computation from
+	// overflowing; the run header and the list itself are checked when it
 	// is loaded.
 	if meta.freelist_pgno != 0 {
 		if meta.freelist_pgno < 2 || u64(meta.freelist_count) > u64(len(file) / size_of(Free_Record)) {

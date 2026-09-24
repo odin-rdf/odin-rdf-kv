@@ -16,6 +16,8 @@ free list itself uses, together with the transaction that freed it:
 Each commit writes the whole list to a new contiguous run, laid out like an
 overflow run: a Page_Header with PAGE_FREELIST and overflow_count, then the
 records from offset 16 across the run's pages, sorted by (txn_id, pgno). The
+run may have one page more than its records need (FREELIST_RUN_SLACK), with
+everything after the last record zeroed. The
 meta page records the run's first page and the number of records, or 0 and
 0 for an empty list. The run's own pages are not in the list it holds; the
 next commit frees them like any other page of the previous snapshot.
@@ -51,7 +53,12 @@ Free_State :: struct {
 	pending: [dynamic]Free_Record,
 }
 
-// Number of pages in a free-list run holding `count` records.
+// The most pages a free-list run may have beyond what its records need. See
+// freelist_place for why one is enough.
+FREELIST_RUN_SLACK :: 1
+
+// Number of pages a free-list run holding `count` records needs. The run
+// itself may be up to FREELIST_RUN_SLACK pages longer.
 freelist_run_pages :: proc "contextless" (page_size: int, count: int) -> int {
 	return overflow_pages(page_size, count * size_of(Free_Record))
 }
@@ -76,8 +83,9 @@ record_less :: proc(a, b: Free_Record) -> bool {
 /*
 Returns the records of the free-list run of `snap`, as a slice into the map
 at `base`, after checking the run's header: it lies within the snapshot,
-records its own page number and PAGE_FREELIST, and has exactly the pages its
-records need. The run was committed, so it is always read from the map.
+records its own page number and PAGE_FREELIST, and has the pages its records
+need, or FREELIST_RUN_SLACK more. The run was committed, so it is always read
+from the map.
 
 The records themselves are not checked here; see freelist_load.
 */
@@ -91,7 +99,7 @@ freelist_run :: proc(base: [^]byte, page_size: int, snap: Snapshot) -> (records:
 	}
 	count := int(snap.freelist_count)
 	off := int(pgno) * page_size
-	pages = run_header_check(base[off:off + page_size], pgno, last, PAGE_FREELIST, count * size_of(Free_Record)) or_return
+	pages = run_header_check(base[off:off + page_size], pgno, last, PAGE_FREELIST, count * size_of(Free_Record), FREELIST_RUN_SLACK) or_return
 	records = ([^]Free_Record)(&base[off + PAGE_HEADER_SIZE])[:count]
 	return records, pages, true
 }
@@ -224,9 +232,10 @@ freelist_build :: proc(txn: ^Txn) -> (next: Free_State, err: Error) {
 	env, w, snap := txn.env, txn.write, txn.snapshot
 	arena := virtual.arena_allocator(&w.arena)
 
+	// The run's length is in its header, which may count a page of slack.
 	run_pages := 0
 	if snap.freelist_pgno != 0 {
-		run_pages = freelist_run_pages(env.page_size, int(snap.freelist_count))
+		run_pages = int(page_header(page_ptr(txn, snap.freelist_pgno)).overflow_count)
 	}
 	freed, alloc_err := make([]Pgno, len(w.freed) + run_pages, arena)
 	if alloc_err != nil {
@@ -285,12 +294,20 @@ or 0, 0 and nil for an empty list.
 
 The run comes from the list's own reusable pages when it can: the lowest
 run of consecutive ones (D5), which then leave the list. Taking j pages
-leaves n − j records, and the run must be exactly the length they need,
-because that is how a run is validated at open. The needed length only
-falls as j grows, so at most one j fits, and it is at most the j = 0 length;
-if no j fits, or no run of that length is free, the run extends the file.
-If the map has no room for that either, the commit fails with Map_Full
-(KV-I-0002 D6).
+leaves n − j records, and j must be at least the length they need. The
+shortest such j is taken, and it is at most the j = 0 length k.
+
+An exact fit doesn't always exist: the needed length falls by one page for
+every page's worth of records, so as j grows it can jump from j + 1 to
+j − 1, as it does for 257 records at 4 KiB pages. The shortest j then has
+one page more than its records need, and never more than that: j − 1 pages
+were too few, so the n − j + 1 records they would have left need at least
+j, and one record fewer needs at least j − 1. That page is the slack a run
+is allowed at open (FREELIST_RUN_SLACK, KV-T-0014).
+
+If no run of the shortest length is free, no longer one is either, and the
+run extends the file with the exact length k. If the map has no room for
+that, the commit fails with Map_Full (KV-I-0002 D6).
 */
 @(private)
 freelist_place :: proc(txn: ^Txn, next: ^Free_State) -> (pgno: Pgno, pages: int, buf: []byte, err: Error) {
@@ -301,7 +318,7 @@ freelist_place :: proc(txn: ^Txn, next: ^Free_State) -> (pgno: Pgno, pages: int,
 	}
 	k := freelist_run_pages(ps, n)
 	for j in 1 ..= min(k, n - 1) {
-		if freelist_run_pages(ps, n - j) != j {
+		if freelist_run_pages(ps, n - j) > j {
 			continue
 		}
 		idx, found := sorted_run_find(next.ready[:], j)
@@ -335,7 +352,8 @@ sorted_run_find :: proc(pages: []Pgno, n: int) -> (idx: int, ok: bool) {
 }
 
 // Writes `state` into `buf`, the run of `pages` pages allocated for it at
-// `pgno`: the header, the tag-0 records, then the pending ones.
+// `pgno`: the header, the tag-0 records, then the pending ones. The rest of
+// the run, a page of slack included, is zeroed.
 @(private)
 freelist_write :: proc(buf: []byte, pgno: Pgno, pages: int, state: Free_State) {
 	h := page_header(buf)

@@ -141,7 +141,7 @@ bench_one :: proc(t: ^testing.T, layout: Bench_Layout, n: int) -> (r: Bench_Resu
 	}
 	snap := kv.env_snapshot(env)
 	r.growth = int(snap.last_pgno - start)
-	r.run_pages = kv.freelist_run_pages(env.page_size, int(snap.freelist_count)) if snap.freelist_pgno != 0 else 0
+	r.run_pages = freelist_run_len(t, env, snap)
 
 	searches := make([]time.Duration, M, context.temp_allocator)
 	for &d in searches {

@@ -23,7 +23,9 @@ read_freelist :: proc(t: ^testing.T, env: ^kv.Env, snap: kv.Snapshot, loc := #ca
 	h := kv.page_header(page)
 	testing.expect_value(t, kv.Pgno(h.pgno), snap.freelist_pgno, loc = loc)
 	testing.expect_value(t, u16(h.flags), kv.PAGE_FREELIST, loc = loc)
-	testing.expect_value(t, int(h.overflow_count), kv.freelist_run_pages(env.page_size, int(snap.freelist_count)), loc = loc)
+	needed := kv.freelist_run_pages(env.page_size, int(snap.freelist_count))
+	pages := int(h.overflow_count)
+	testing.expectf(t, pages >= needed && pages <= needed + kv.FREELIST_RUN_SLACK, "run of %d pages for %d records, which need %d", pages, snap.freelist_count, needed, loc = loc)
 
 	records := make([]kv.Free_Record, snap.freelist_count, context.temp_allocator)
 	off := i64(snap.freelist_pgno) * i64(env.page_size) + kv.PAGE_HEADER_SIZE
@@ -153,7 +155,7 @@ test_freelist_round_trip :: proc(t: ^testing.T) {
 		added := make([dynamic]kv.Pgno, context.temp_allocator)
 		append(&added, ..txn.write.freed[:])
 		if run := txn.snapshot.freelist_pgno; run != 0 {
-			for i in 0 ..< kv.freelist_run_pages(ps, int(txn.snapshot.freelist_count)) {
+			for i in 0 ..< freelist_run_len(t, env, txn.snapshot) {
 				append(&added, run + kv.Pgno(i))
 			}
 			runs_seen += 1
@@ -169,7 +171,7 @@ test_freelist_round_trip :: proc(t: ^testing.T) {
 		// The new run is in reusable pages, or at the end of the file.
 		snap := kv.env_snapshot(env)
 		if snap.freelist_pgno != 0 {
-			run := make([]kv.Pgno, kv.freelist_run_pages(ps, int(snap.freelist_count)), context.temp_allocator)
+			run := make([]kv.Pgno, freelist_run_len(t, env, snap), context.temp_allocator)
 			for &p, i in run {
 				p = snap.freelist_pgno + kv.Pgno(i)
 			}
@@ -575,6 +577,27 @@ test_freelist_load_valid :: proc(t: ^testing.T) {
 	testing.expect(t, slice.equal(env.free.pending[:], []kv.Free_Record{{5, 5}, {8, 5}}), "wrong pending records")
 }
 
+// A run may have one page more than its records need, which placement
+// leaves when no length fits exactly (KV-T-0014). The records are read as
+// usual, and the slack page belongs to the run.
+@(test)
+test_freelist_load_accepts_a_page_of_slack :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+
+	env, err := open_hand_list(t, temp_dir_file(dir, DB), {records = hand_records(), run = 30, count = -1, overflow_count = 1 + kv.FREELIST_RUN_SLACK})
+	testing.expect_value(t, err, kv.Error.None)
+	if err != .None {
+		return
+	}
+	defer kv.env_close(env)
+	testing.expect(t, slice.equal(env.free.ready[:], []kv.Pgno{3, 4, 9, 12}), "wrong ready pages")
+	testing.expect(t, slice.equal(env.free.pending[:], []kv.Free_Record{{5, 5}, {8, 5}}), "wrong pending records")
+	reader, _ := kv.txn_begin(env)
+	defer kv.txn_abort(&reader)
+	testing.expect_value(t, freelist_run_len(t, env, reader.snapshot), 2)
+}
+
 @(test)
 test_freelist_load_rejects_bad_lists :: proc(t: ^testing.T) {
 	Case :: struct {
@@ -594,7 +617,7 @@ test_freelist_load_rejects_bad_lists :: proc(t: ^testing.T) {
 		{"page 0", proc(l: ^Hand_List) {l.records[0].pgno = 0}},
 		{"header flags", proc(l: ^Hand_List) {l.flags = kv.PAGE_OVERFLOW}},
 		{"header page number", proc(l: ^Hand_List) {l.header_pgno = 31}},
-		{"header page count", proc(l: ^Hand_List) {l.overflow_count = 2}},
+		{"header page count, too many", proc(l: ^Hand_List) {l.overflow_count = 1 + kv.FREELIST_RUN_SLACK + 1}},
 		{"count needs more pages than the header says", proc(l: ^Hand_List) {l.count = 300; l.overflow_count = 1}},
 		{"count but no run", proc(l: ^Hand_List) {l.run = 0; l.count = 3}},
 		{"run but no records", proc(l: ^Hand_List) {l.count = 0; l.overflow_count = 1}},
@@ -666,48 +689,57 @@ test_page_alloc_reuses_lowest_first :: proc(t: ^testing.T) {
 	testing.expect(t, slice.equal(env.free.pending[:], pending), "pending records changed")
 }
 
-// `n` tag-0 records for pages first, first + 1, ... (temp allocator).
+// `n` tag-0 records for pages first, first + stride, ... (temp allocator).
 @(private = "file")
-ready_records :: proc(first: kv.Pgno, n: int) -> []kv.Free_Record {
+ready_records :: proc(first: kv.Pgno, n: int, stride := 1) -> []kv.Free_Record {
 	records := make([]kv.Free_Record, n, context.temp_allocator)
 	for &r, i in records {
-		r.pgno = u64le(first + kv.Pgno(i))
+		r.pgno = u64le(first + kv.Pgno(stride * i))
 	}
 	return records
 }
 
-// The commit's run goes into reusable pages only when it can be exactly as
-// long as the records left after taking it need; otherwise it extends the
-// file. Either way the list it writes opens again.
+// The commit's run goes into reusable pages when a run of them is at least
+// as long as the records left after taking it need, taking the shortest
+// such length; otherwise it extends the file. Either way the list it writes
+// opens again, and the next commit frees every page of the run, a page of
+// slack included.
 @(test)
 test_freelist_run_length_fits_its_records :: proc(t: ^testing.T) {
 	Case :: struct {
-		// Reusable pages 2, 3, ..., and how many single pages the
-		// transaction takes from the front of them.
+		// Reusable pages 2, 2 + stride, ..., and how many single pages
+		// the transaction takes from the front of them.
 		ready, taken: int,
-		// Where the new run should go, its records, and last_pgno after.
+		stride:       int,
+		// Where the new run should go, its records and pages, and
+		// last_pgno after.
 		run:          kv.Pgno,
 		count:        u64,
+		pages:        int,
 		last:         kv.Pgno,
 	}
-	LAST :: 400
+	LAST :: 600
+	OLD_RUN :: 590
 	cases := []Case {
 		// 99 left plus the old run's page: 100 records, 1 page. Taking a
 		// page leaves 99, which still need 1.
-		{ready = 100, taken = 1, run = 3, count = 99, last = LAST},
+		{ready = 100, taken = 1, stride = 1, run = 3, count = 99, pages = 1, last = LAST},
 		// 254 left plus the old run's 2 pages: 256 records need 2 pages,
 		// but taking 2 leaves 254, which need 1, and taking 1 leaves 255,
 		// which need 1: a 1-page run in reusable pages.
-		{ready = 256, taken = 2, run = 4, count = 255, last = LAST},
+		{ready = 256, taken = 2, stride = 1, run = 4, count = 255, pages = 1, last = LAST},
 		// 255 left plus 2: 257 records. Taking 1 leaves 256, which need
-		// 2; taking 2 leaves 255, which need 1. No length fits, so the
-		// run extends the file.
-		{ready = 256, taken = 1, run = LAST + 1, count = 257, last = LAST + 2},
+		// 2; taking 2 leaves 255, which need 1. No length fits exactly, so
+		// the run takes 2 pages and has one of slack (KV-T-0014).
+		{ready = 256, taken = 1, stride = 1, run = 3, count = 255, pages = 2, last = LAST},
+		// The same 257 records, but no two reusable pages are consecutive,
+		// so the run extends the file at the length they all need.
+		{ready = 256, taken = 1, stride = 2, run = LAST + 1, count = 257, pages = 2, last = LAST + 2},
 	}
 	for c in cases {
 		dir := temp_dir_create(t)
 		path := temp_dir_file(dir, DB)
-		env, err := open_hand_list(t, path, {records = ready_records(2, c.ready), run = 300, count = -1, overflow_count = -1, last_pgno = LAST})
+		env, err := open_hand_list(t, path, {records = ready_records(2, c.ready, c.stride), run = OLD_RUN, count = -1, overflow_count = -1, last_pgno = LAST})
 		testing.expectf(t, err == .None, "ready %d: env_open returned %v", c.ready, err)
 		if err == .None {
 			txn, _ := kv.txn_begin(env, read_only = false)
@@ -716,14 +748,27 @@ test_freelist_run_length_fits_its_records :: proc(t: ^testing.T) {
 			}
 			testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
 			snap := kv.env_snapshot(env)
-			testing.expectf(t, snap.freelist_pgno == c.run && snap.freelist_count == c.count && snap.last_pgno == c.last,
-				"ready %d, taken %d: run %d with %d records, last_pgno %d", c.ready, c.taken, snap.freelist_pgno, snap.freelist_count, snap.last_pgno)
+			pages := freelist_run_len(t, env, snap)
+			testing.expectf(t, snap.freelist_pgno == c.run && snap.freelist_count == c.count && pages == c.pages && snap.last_pgno == c.last,
+				"ready %d, taken %d, stride %d: run %d of %d pages with %d records, last_pgno %d", c.ready, c.taken, c.stride, snap.freelist_pgno, pages, snap.freelist_count, snap.last_pgno)
+			read_freelist(t, env, snap)
 			kv.env_close(env)
 			env, err = kv.env_open(path)
-			testing.expectf(t, err == .None, "ready %d, taken %d: reopening returned %v", c.ready, c.taken, err)
-			if env != nil {
-				kv.env_close(env)
+			testing.expectf(t, err == .None, "ready %d, taken %d, stride %d: reopening returned %v", c.ready, c.taken, c.stride, err)
+		}
+		if err == .None {
+			// The next commit frees the whole run, as its header gives it.
+			snap := kv.env_snapshot(env)
+			txn, _ := kv.txn_begin(env, read_only = false)
+			testing.expect_value(t, kv.put(&txn, transmute([]byte)string("k"), transmute([]byte)string("v")), kv.Error.None)
+			testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
+			for i in 0 ..< c.pages {
+				p := u64le(snap.freelist_pgno + kv.Pgno(i))
+				testing.expectf(t, slice.contains(env.free.pending[:], kv.Free_Record{pgno = p, txn_id = u64le(snap.txn_id + 1)}), "stride %d: run page %d was not freed", c.stride, p)
 			}
+		}
+		if env != nil {
+			kv.env_close(env)
 		}
 		temp_dir_destroy(&dir, DB)
 	}

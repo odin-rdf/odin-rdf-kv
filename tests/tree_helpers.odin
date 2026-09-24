@@ -134,6 +134,17 @@ read_page :: proc(t: ^testing.T, env: ^kv.Env, pgno: kv.Pgno, buf: ^Page_Buf) ->
 	return page
 }
 
+// The length in pages of the free-list run of `snap`, from its header on
+// disk: the pages its records need, or one more (kv.FREELIST_RUN_SLACK).
+// 0 if the snapshot has no run.
+freelist_run_len :: proc(t: ^testing.T, env: ^kv.Env, snap: kv.Snapshot) -> int {
+	if snap.freelist_pgno == 0 {
+		return 0
+	}
+	buf: Page_Buf
+	return int(kv.page_header(read_page(t, env, snap.freelist_pgno, &buf)).overflow_count)
+}
+
 // Writes `page` at page number `pgno`, whatever its header says.
 write_page :: proc(t: ^testing.T, env: ^kv.Env, pgno: kv.Pgno, page: []byte) {
 	testing.expect_value(t, kv.os_pwrite(env.fd, page, i64(pgno) * i64(env.page_size)), kv.Error.None)
