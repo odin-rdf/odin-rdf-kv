@@ -32,6 +32,7 @@ Metis (`.metis/`) is the system of record for plans, decisions and progress. Sta
 
 ```sh
 scripts/test.sh                 # debug, -o:speed, -sanitize:address, plus odin check for darwin/linux × arm64/amd64
+scripts/test.sh --steady        # the same, plus the slow steady-state tests (-define:KV_STEADY=true)
 scripts/test.sh -define:ODIN_TEST_NAMES=kv_tests.test_cursor_seek      # extra args go to every `odin test`
 scripts/test.sh -define:ODIN_TEST_RANDOM_SEED=1234                      # reproduce a randomized failure (seed is in the message)
 scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd64 (emulated)
@@ -39,7 +40,7 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 
 - **Linux tests:** these need Docker. On macOS that is OrbStack, which is normally stopped: run `orb start` first and `orb stop` afterwards. `scripts/linux.Dockerfile` pins the Odin release, so keep its `ODIN_VERSION` in step with `odin version` (currently dev-2026-09).
 - **ThreadSanitizer:** `-sanitize:thread` works on macOS arm64. Use it for `test_snapshot_isolation_across_threads` and `test_reader_table_across_threads`. A race only shows when the two accesses overlap, so run a threaded check more than once.
-- **Suite time:** the plateau and full-map tests make 10⁴ synced commits each, and on macOS (`F_FULLFSYNC`, about 4 ms) they take about 3 minutes per configuration. While iterating, pass `-define:KV_STEADY_COMMITS=1000`.
+- **Steady-state tests are on demand:** the plateau, full-map and long-reader tests make thousands of synced commits (the first two 10⁴ each; `F_FULLFSYNC` on macOS is about 4 ms), about 3 minutes per configuration, so they only run with `-define:KV_STEADY=true` or `scripts/test.sh --steady`. Run them after changing allocation, the free list or commit. While iterating, also pass `-define:KV_STEADY_COMMITS=1000`.
 - **Free-list cost measurement:** `odin test tests -o:speed -define:KV_BENCH=true -define:ODIN_TEST_NAMES=kv_tests.test_bench_free_list_cost`.
 - **Supported targets:** only 64-bit targets are supported (`#assert(size_of(int) == 8)`).
 
@@ -68,7 +69,7 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 - `tests/freelist_test.odin`: `open_hand_list` opens a database with a hand-written free list.
 - `tests/steady_test.odin`: the steady-state workload (`steady_commit`) and `expect_latest_ok` (`space_check` and `tree_check` on a new reader).
 
-**Other test files:** `reader_test.odin` (reader table), `reuse_test.odin` (reuse rules), `steady_test.odin` (`env_stats`, plateau, full map, long reader), `isolation_test.odin` (threads, including readers that come and go while pages are reused), and `bench_test.odin` (the free-list cost measurement, only registered with `-define:KV_BENCH=true`).
+**Other test files:** `reader_test.odin` (reader table), `reuse_test.odin` (reuse rules), `steady_test.odin` (`env_stats`; plateau, full map and long reader on demand), `isolation_test.odin` (threads, including readers that come and go while pages are reused), and `bench_test.odin` (the free-list cost measurement, only registered with `-define:KV_BENCH=true`).
 
 ## Invariants and conventions
 

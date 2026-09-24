@@ -16,6 +16,33 @@ STEADY_KEYS :: 1_000
 STEADY_COMMITS :: #config(KV_STEADY_COMMITS, 10_000)
 #assert(STEADY_COMMITS >= 1_000 && STEADY_COMMITS % 100 == 0)
 
+/*
+The plateau, full-map and long-reader tests make thousands of synced
+commits, several minutes per build configuration, so they are not part of
+the ordinary suite. Run them with -define:KV_STEADY=true, or with
+`scripts/test.sh --steady`, after changing allocation, the free list or
+commit.
+
+Only the registration is guarded, as for the benchmark: the procedures are
+compiled and type-checked by every run.
+*/
+when #config(KV_STEADY, false) {
+	@(test)
+	test_steady_state_plateau :: proc(t: ^testing.T) {
+		steady_state_plateau(t)
+	}
+
+	@(test)
+	test_steady_state_full_map :: proc(t: ^testing.T) {
+		steady_state_full_map(t)
+	}
+
+	@(test)
+	test_steady_state_long_reader :: proc(t: ^testing.T) {
+		steady_state_long_reader(t)
+	}
+}
+
 // Most keys one steady-state commit overwrites, and the most pages one of
 // its values takes in an overflow run.
 STEADY_COMMIT_KEYS :: 20
@@ -219,8 +246,7 @@ reuse would fail, is that the second half of the commits adds at most 1% of
 the pages it writes (without reuse, every page written is added), and that the
 file stays within twice the size the data first loaded at.
 */
-@(test)
-test_steady_state_plateau :: proc(t: ^testing.T) {
+steady_state_plateau :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, DB)
 
@@ -282,8 +308,7 @@ worst case. A commit allocates at most a leaf and an overflow run per key,
 plus the branch pages above them and the free-list run. A held reader
 first fills the map, so every later allocation is a reuse.
 */
-@(test)
-test_steady_state_full_map :: proc(t: ^testing.T) {
+steady_state_full_map :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, DB)
 	path := temp_dir_file(dir, DB)
@@ -359,8 +384,7 @@ doesn't grow at all.
 free_ready stays level rather than falling, as KV-T-0013 recorded: each
 commit frees about as many pages as it takes. It is logged.
 */
-@(test)
-test_steady_state_long_reader :: proc(t: ^testing.T) {
+steady_state_long_reader :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, DB)
 

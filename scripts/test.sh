@@ -4,8 +4,16 @@
 # other supported targets. Extra arguments are passed to every `odin test`,
 # e.g. -define:ODIN_TEST_NAMES=kv_tests.test_cursor_seek
 # or  -define:ODIN_TEST_RANDOM_SEED=1234
+#
+# --steady (first argument) also runs the steady-state tests, which make
+# thousands of synced commits: several minutes per configuration on macOS.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+if [[ "${1:-}" == "--steady" ]]; then
+	shift
+	set -- -define:KV_STEADY=true "$@"
+fi
 
 out="${TMPDIR:-/tmp}/kv_tests"
 run() {
