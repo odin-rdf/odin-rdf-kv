@@ -7,7 +7,7 @@ created_at: 2026-09-23T22:03:32.986460+00:00
 updated_at: 2026-09-24T09:23:22.444046+00:00
 parent: KV-V-0001
 blocked_by: []
-archived: false
+archived: true
 
 tags:
   - "#initiative"

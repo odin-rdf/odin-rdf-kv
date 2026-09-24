@@ -7,7 +7,7 @@ An embedded, LMDB-style key/value store in Odin: a copy-on-write B+tree in one m
 Metis (`.metis/`) is the system of record for plans, decisions and progress. Start here:
 
 - `.metis/vision.md` (KV-V-0001): the design, the build order (steps 1–7) and the current state.
-- `.metis/initiatives/KV-I-0001/initiative.md`: steps 1–3 (completed). Its **Results** section lists the exit-criteria evidence, every deviation from the design, and the known limitations.
+- `.metis/archived/initiatives/KV-I-0001/initiative.md`: steps 1–3 (completed and archived). Its **Results** section lists the exit-criteria evidence, every deviation from the design, and the known limitations.
 - `.metis/archived/initiatives/KV-I-0002/initiative.md`: step 5, page reuse (completed and archived). Its **Results** section has the same, plus the steady-state and free-list cost measurements.
 - Each task's **Status Updates** section records decisions made during implementation and the reasons for them.
 
