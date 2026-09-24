@@ -188,7 +188,7 @@ run of reusable pages that survives the single pages taking the lowest
 reusable pages first. Conservative, so that a change that passes it can't
 hit Map_Full part-way.
 */
-@(private = "file")
+@(private)
 pages_available :: proc(txn: ^Txn, singles: int, run := 0) -> bool {
 	w := txn.write
 	end := end_room(txn)

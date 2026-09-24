@@ -50,7 +50,9 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 	if txn.err != .None {
 		return txn.err
 	}
-	if len(txn.write.dirty) == 0 {
+	// Changes are counted, not dirty pages: a delete that empties the tree
+	// frees every page it copied, and leaves none dirty.
+	if txn.mods == 0 && len(txn.write.dirty) == 0 {
 		return .None
 	}
 

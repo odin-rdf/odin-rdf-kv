@@ -58,18 +58,19 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 | `freelist.odin` | Free-list records and run layout, load and validate at open, release at `txn_begin`, build and place at commit |
 | `overflow.odin` | Overflow value runs |
 | `commit.odin` | `txn_commit`, file growth |
+| `delete.odin` | `del`: removal, the rebalance loop (merge with a sibling, drop empty pages) and root collapse |
 | `cursor.odin` | Cursors |
 | `check.odin` | `tree_check`, and `space_check` (every page owned exactly once) |
 | `os_*.odin` | Platform layer |
 
 **Test helpers:**
-- `tests/tree_helpers.odin`: `build_tree_file` builds any tree shape directly.
+- `tests/tree_helpers.odin`: `build_tree_file` builds a packed tree directly; `build_tree_shape` builds any shape, with each leaf's entries and each level's grouping given (underfull pages, single-child branches).
 - `tests/model.odin`: the randomized model and `model_diff`. `run_model` in `tests/model_test.odin` also holds up to 4 readers across commits.
 - `tests/helpers.odin`: temporary directories and `Page_Buf`.
 - `tests/freelist_test.odin`: `open_hand_list` opens a database with a hand-written free list.
 - `tests/steady_test.odin`: the steady-state workload (`steady_commit`) and `expect_latest_ok` (`space_check` and `tree_check` on a new reader).
 
-**Other test files:** `reader_test.odin` (reader table), `reuse_test.odin` (reuse rules), `steady_test.odin` (`env_stats`; plateau, full map and long reader on demand), `isolation_test.odin` (threads, including readers that come and go while pages are reused), and `bench_test.odin` (the free-list cost measurement, only registered with `-define:KV_BENCH=true`).
+**Other test files:** `delete_test.odin` (delete shapes and semantics; `sized_entries`, `expect_shape_keys`, `commit_ok`), `reader_test.odin` (reader table), `reuse_test.odin` (reuse rules), `steady_test.odin` (`env_stats`; plateau, full map and long reader on demand), `isolation_test.odin` (threads, including readers that come and go while pages are reused), and `bench_test.odin` (the free-list cost measurement, only registered with `-define:KV_BENCH=true`).
 
 ## Invariants and conventions
 
