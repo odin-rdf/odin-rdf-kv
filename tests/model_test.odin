@@ -16,6 +16,8 @@ Model_Stats :: struct {
 	// commits they were held across in total, and pages that commits wrote
 	// in place of a page of the file they began from (reused pages).
 	held_readers, held_commits, reused_pages:                 int,
+	// Pages spilled from the dirty-page pool (Stats.spills at the end).
+	spills:                                                    int,
 }
 
 // At most this many read transactions are held at once.
@@ -244,6 +246,9 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			stats.scans += 1
 		}
 
+		if !expect_pool_within(t, env) {
+			return
+		}
 		txn_ops += 1
 		if txn_ops < txn_limit && op < ops - 1 {
 			continue
@@ -255,7 +260,7 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			return
 		}
 		if rand.int_max(100) < 85 || op == ops - 1 {
-			for pgno in txn.write.dirty {
+			for pgno in written_pgnos(&txn) {
 				if pgno <= begin_last {
 					stats.reused_pages += 1
 				}
@@ -297,6 +302,7 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 		}
 
 		if reopen {
+			stats.spills += kv.env_stats(env).spills
 			kv.env_close(env)
 			env, err = kv.env_open(path, options)
 			testing.expect_value(t, err, kv.Error.None)
@@ -311,6 +317,7 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			stats.reopens += 1
 		}
 	}
+	stats.spills += kv.env_stats(env).spills
 	return stats, false
 }
 
@@ -397,6 +404,22 @@ test_model_randomized :: proc(t: ^testing.T) {
 	// Readers were held across commits while pages were being reused.
 	testing.expect(t, stats.held_readers >= 50 && stats.held_commits >= 5 * stats.held_readers, "too few readers held")
 	testing.expect(t, stats.reused_pages > 10_000, "too few pages reused")
+}
+
+// The same workload with the smallest dirty-page pool: transactions of up to
+// 500 operations spill again and again, so pages are re-touched after being
+// spilled, spilled pages and overflow runs are freed within the
+// transaction, and aborts discard spilled pages (KV-I-0004 D4).
+@(test)
+test_model_randomized_min_pool :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+
+	stats, _ := run_model(t, temp_dir_file(dir, DB), kv.Options{map_size = 4 << 30, dirty_budget = MIN_DIRTY_BUDGET}, ops = 100_000, keys = 3_000)
+	log.infof("[seed %d] %v", t.seed, stats)
+	testing.expect(t, stats.puts > 20_000 && stats.dels > 10_000, "too few changes")
+	testing.expect(t, stats.commits > 100 && stats.aborts > 10, "too few commits or aborts")
+	testing.expect(t, stats.spills > 1_000, "too few pages spilled")
 }
 
 @(test)

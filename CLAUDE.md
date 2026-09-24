@@ -16,7 +16,7 @@ Metis (`.metis/`) is the system of record for plans, decisions and progress. Sta
 
 - `.metis/initiatives/KV-I-0004/initiative.md`: step 6, the memory budget (decomposed, tasks KV-T-0019 to KV-T-0024). Its decisions D1–D12 are approved; the first task is a platform measurement whose results can amend D1, D9 and D10.
 
-**Next up:** KV-T-0021, spilling (KV-I-0004 D2–D6). The measurement (KV-T-0019) and the dirty-page pool (KV-T-0020) are done. `Stats` (`env_stats`) is where step 6's figures go.
+**Next up:** KV-T-0022, chunk accounting (KV-I-0004 D7, D11). The measurement (KV-T-0019), the dirty-page pool (KV-T-0020) and spilling (KV-T-0021) are done. `Stats` (`env_stats`) is where step 6's figures go.
 
 ## Working agreement
 
@@ -42,9 +42,10 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 ```
 
 - **Linux tests:** these need Docker. On macOS that is OrbStack, which is normally stopped: run `orb start` first and `orb stop` afterwards. `scripts/linux.Dockerfile` pins the Odin release, so keep its `ODIN_VERSION` in step with `odin version` (currently dev-2026-09).
-- **ThreadSanitizer:** `-sanitize:thread` works on macOS arm64. Use it for `test_snapshot_isolation_across_threads` and `test_reader_table_across_threads`. A race only shows when the two accesses overlap, so run a threaded check more than once.
-- **Steady-state tests are on demand:** the plateau, full-map, long-reader and churn tests make thousands of synced commits (all but the long reader 10⁴ each; `F_FULLFSYNC` on macOS is about 4 ms), about 3½–4 minutes per configuration, so they only run with `-define:KV_STEADY=true` or `scripts/test.sh --steady`. Run them after changing allocation, the free list or commit. While iterating, also pass `-define:KV_STEADY_COMMITS=1000`.
+- **ThreadSanitizer:** `-sanitize:thread` works on macOS arm64. Use it for `test_snapshot_isolation_across_threads`, `test_snapshot_isolation_min_pool` and `test_reader_table_across_threads`. A race only shows when the two accesses overlap, so run a threaded check more than once.
+- **Steady-state tests are on demand:** the plateau, full-map, long-reader and churn tests make thousands of synced commits (all but the long reader 10⁴ each; `F_FULLFSYNC` on macOS is about 4 ms), about 3½–4 minutes per configuration, so they only run with `-define:KV_STEADY=true` or `scripts/test.sh --steady`. Run them after changing allocation, the free list or commit. While iterating, also pass `-define:KV_STEADY_COMMITS=1000`. `-define:KV_STEADY_DIRTY_BUDGET=200704` runs them with the smallest dirty-page pool (49 pages) instead of the default.
 - **Free-list cost measurement:** `odin test tests -o:speed -define:KV_BENCH=true -define:ODIN_TEST_NAMES=kv_tests.test_bench_free_list_cost`.
+- **Spill cost:** `odin test tests -o:speed -define:KV_BENCH=true -define:ODIN_TEST_NAMES=kv_tests.test_bench_spill_cost` (reported, not asserted).
 - **Fill after deletes:** `odin test tests -o:speed -define:KV_BENCH=true -define:ODIN_TEST_NAMES=kv_tests.test_bench_delete_fill` (reported, not asserted).
 - **Supported targets:** only 64-bit targets are supported (`#assert(size_of(int) == 8)`).
 
@@ -55,14 +56,14 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 | `types.odin` | `Pgno`, `Txn_Id`, `Error`, format constants |
 | `page.odin` | On-disk page and node layout, size limits, slotted-page operations, split and merge helpers, `page_check` |
 | `meta.odin` | Meta page layout and checksum |
-| `env.odin` | Open and close, choosing the meta page, `meta_write`, the reader table, `env_stats` |
-| `txn.odin` | `Txn` (a value type), `Write_State` (on the heap; `dirty` maps a page number to its pool slots), the reuse horizon, `page_ptr` |
-| `pool.odin` | `Dirty_Pool`, the dirty-page pool (KV-I-0004 D1): slots reserved at open, committed on first use, released when the write transaction ends; `pool_available` for the up-front `Out_Of_Memory` check |
+| `env.odin` | Open and close, choosing the meta page, `meta_write`, the reader table, `env_stats`, `file_grow` |
+| `txn.odin` | `Txn` (a value type), `Write_State` (on the heap; `dirty` maps a page number to its pool slots, `spilled` the pages already written to the file), the reuse horizon, `page_ptr` |
+| `pool.odin` | `Dirty_Pool`, the dirty-page pool (KV-I-0004 D1): slots reserved at open, committed on first use, released when the write transaction ends; `pool_make_room` and `spill` (D2–D4: the least recently touched quarter, written in page order) |
 | `tree.odin` | `tree_search`, `get` |
-| `write.odin` | `page_alloc` (loose, then reusable, then the end of the file), `pages_available`, `page_free`, `page_touch`, `put`, splits |
-| `freelist.odin` | Free-list records and run layout, load and validate at open, release at `txn_begin`, build and place at commit |
-| `overflow.odin` | Overflow value runs |
-| `commit.odin` | `txn_commit`, file growth |
+| `write.odin` | `page_alloc` (loose, then reusable, then the end of the file), `page_take` (the same page numbers without pool slots), `pages_available`, `page_free`, `page_touch` (a spilled page comes back under its own number), `put`, splits |
+| `freelist.odin` | Free-list records and run layout, load and validate at open, release at `txn_begin`, build and place at commit, `freelist_write` (a page at a time through one slot, D6) |
+| `overflow.odin` | Overflow value runs; `overflow_write` writes a run straight to the file (D5) |
+| `commit.odin` | `txn_commit` |
 | `delete.odin` | `del`: removal, the rebalance loop (merge with a sibling, drop empty pages) and root collapse |
 | `cursor.odin` | Cursors |
 | `check.odin` | `tree_check`, and `space_check` (every page owned exactly once) |
@@ -71,19 +72,19 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 **Test helpers:**
 - `tests/tree_helpers.odin`: `build_tree_file` builds a packed tree directly; `build_tree_shape` builds any shape, with each leaf's entries and each level's grouping given (underfull pages, single-child branches).
 - `tests/model.odin`: the randomized model and `model_diff`. `run_model` in `tests/model_test.odin` also holds up to 4 readers across commits.
-- `tests/helpers.odin`: temporary directories, `Page_Buf`, `dirty_buf` (a dirty page's pool buffer) and `BIG_DIRTY_BUDGET` (for tests whose one transaction outgrows the default pool, until spilling).
+- `tests/helpers.odin`: temporary directories, `Page_Buf`, `dirty_buf` (a dirty page's pool buffer), `written_pgnos` (every dirty and spilled page or run of a write transaction), `MIN_DIRTY_BUDGET` (the smallest pool) and `expect_pool_within` (the pool within its budget).
 - `tests/freelist_test.odin`: `open_hand_list` opens a database with a hand-written free list.
 - `tests/steady_test.odin`: the steady-state workload (`steady_commit`) and `expect_latest_ok` (`space_check` and `tree_check` on a new reader).
 
-**Other test files:** `delete_test.odin` (delete shapes and semantics; `sized_entries`, `expect_shape_keys`, `commit_ok`), `reader_test.odin` (reader table), `reuse_test.odin` (reuse rules), `steady_test.odin` (`env_stats`; plateau, full map, long reader and insert/delete churn on demand), `isolation_test.odin` (threads, including readers that come and go while pages are reused), `pool_test.odin` (the dirty-page pool: budget, live figures, release checked against the OS, `Out_Of_Memory`), `platform_test.odin` (KV-T-0019's measurement, only registered with `-define:KV_PLATFORM=true`; `platform_residency` is usable by any test), `bench_test.odin` and `fill_test.odin` (the free-list cost and the fill after deletes, only registered with `-define:KV_BENCH=true`).
+**Other test files:** `delete_test.odin` (delete shapes and semantics; `sized_entries`, `expect_shape_keys`, `commit_ok`), `reader_test.odin` (reader table), `reuse_test.odin` (reuse rules), `steady_test.odin` (`env_stats`; plateau, full map, long reader and insert/delete churn on demand), `isolation_test.odin` (threads, including readers that come and go while pages are reused), `pool_test.odin` (the dirty-page pool: budget, live figures, release checked against the OS), `spill_test.odin` (spilling with the smallest pool: ten times the pool, re-touch and free of spilled pages, abort, readers, a value larger than the pool), `spill_bench_test.odin` (the spill cost, only registered with `-define:KV_BENCH=true`), `platform_test.odin` (KV-T-0019's measurement, only registered with `-define:KV_PLATFORM=true`; `platform_residency` is usable by any test), `bench_test.odin` and `fill_test.odin` (the free-list cost and the fill after deletes, only registered with `-define:KV_BENCH=true`).
 
 ## Invariants and conventions
 
 - **`page_ptr(txn, pgno)` is the only way to reach a page,** and step 6's memory accounting will hook in there. Overflow runs are read through `overflow_value`, which validates the run.
 - **Zero-copy lifetimes:**
   - a slice from a read transaction is valid until the transaction ends;
-  - a slice from a write transaction is valid until the next `put`;
-  - `put` must not receive slices that point into the same transaction's dirty pages.
+  - a slice from a write transaction is valid until the next `put` or `del`, which may spill the page it points into and reuse its slot;
+  - `put` must not receive slices that point into the same transaction's pages, dirty or spilled (a slice into a spilled page points into the map).
 - **Clone before modifying:** copy any key or value you still need before rewriting the page it points into. Splits rewrite both pages, and a test helper got this wrong once.
 - **Alignment:**
   - node headers are `#packed` and are read and written by value only; never take the address of a packed field;
@@ -93,6 +94,8 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 - **Write-path tests need a committed tree underneath.** Put into a tree that was committed first (for example with `build_tree_file`), otherwise every page is already dirty and copy-on-write never runs.
 - **Structural checks:** tests call `kv.tree_check` or `kv.page_check` after changes, and `kv.space_check` after every commit.
 - **Dirty pages live in `Env.pool`,** not in the transaction: `page_free` of a dirty page frees its slots for the next `page_alloc`, so don't read a page after freeing it. Every slot is released when the write transaction ends.
+- **Spill only between operations** (KV-I-0004 D2): `pool_make_room` runs at the start of `put` and `del` (with their worst case, next to `pages_available`) and in `txn_commit`, never inside an operation, which holds slices into its dirty pages across `page_alloc`. It asserts `Write_State.in_op`. `page_alloc` never spills.
+- **A page is in `dirty` or `spilled`, never both.** A spilled page (or an overflow run, which is written straight to the file) is still the transaction's own: `page_ptr` reads it through the map, `page_touch` copies it back into a slot under the same number (no copy-on-write, no `freed` entry), and `page_free` makes it loose. Writing it before the commit is safe because pages a write transaction allocates are in no snapshot anyone can read (KV-I-0002 D1); the file is grown (`file_grow`) before anything is written past its end.
 - **Free pages:** a page freed by commit `T` is reused only once `T ≤ min(oldest reader, S − 1)` (KV-I-0002 D1). `Env.free` changes only at `txn_begin(rw)` (the release) and after a durable commit; a write transaction records what it takes instead.
 
 ## Pitfalls hit so far

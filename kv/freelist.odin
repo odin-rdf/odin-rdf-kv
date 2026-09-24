@@ -288,9 +288,10 @@ freelist_build :: proc(txn: ^Txn) -> (next: Free_State, err: Error) {
 }
 
 /*
-Allocates the run for `next`, the free list being committed, registered as
-a dirty page of `txn`. Returns its first page, its length and its buffer,
-or 0, 0 and nil for an empty list.
+Allocates the run for `next`, the free list being committed. Returns its
+first page and its length, or 0 and 0 for an empty list. The run takes page
+numbers only: freelist_write writes it to the file a page at a time
+(KV-I-0004 D6).
 
 The run comes from the list's own reusable pages when it can: the lowest
 run of consecutive ones (D5), which then leave the list. Taking j pages
@@ -307,15 +308,14 @@ is allowed at open (FREELIST_RUN_SLACK, KV-T-0014).
 
 If no run of the shortest length is free, no longer one is either, and the
 run extends the file with the exact length k. If the map has no room for
-that, the commit fails with Map_Full (KV-I-0002 D6). If the dirty-page pool has no
-run of free slots for it, the commit fails with Out_Of_Memory.
+that, the commit fails with Map_Full (KV-I-0002 D6).
 */
 @(private)
-freelist_place :: proc(txn: ^Txn, next: ^Free_State) -> (pgno: Pgno, pages: int, buf: []byte, err: Error) {
+freelist_place :: proc(txn: ^Txn, next: ^Free_State) -> (pgno: Pgno, pages: int, err: Error) {
 	ps := txn.env.page_size
 	n := free_state_count(next^)
 	if n == 0 {
-		return 0, 0, nil, .None
+		return 0, 0, .None
 	}
 	k := freelist_run_pages(ps, n)
 	for j in 1 ..= min(k, n - 1) {
@@ -326,14 +326,12 @@ freelist_place :: proc(txn: ^Txn, next: ^Free_State) -> (pgno: Pgno, pages: int,
 		if !found {
 			break
 		}
-		slot := pool_alloc(&txn.env.pool, j, txn.mods) or_return
 		pgno = next.ready[idx]
-		buf = dirty_add(txn, pgno, slot, j)
 		remove_range(&next.ready, idx, idx + j)
-		return pgno, j, buf, .None
+		return pgno, j, .None
 	}
-	pgno, buf = page_alloc_end(txn, k) or_return
-	return pgno, k, buf, .None
+	pgno = page_take_end(txn, k) or_return
+	return pgno, k, .None
 }
 
 // Returns the index of the lowest run of `n` consecutive page numbers in
@@ -352,22 +350,47 @@ sorted_run_find :: proc(pages: []Pgno, n: int) -> (idx: int, ok: bool) {
 	return 0, false
 }
 
-// Writes `state` into `buf`, the run of `pages` pages allocated for it at
-// `pgno`: the header, the tag-0 records, then the pending ones. The rest of
-// the run, a page of slack included, is zeroed.
+/*
+Writes `state` to the run of `pages` pages allocated for it at `pgno`: the
+header, the tag-0 records, then the pending ones. The rest of the run, a
+page of slack included, is zeroed. The run is filled and written one page
+at a time through one slot of the dirty-page pool, which must have one free
+(KV-I-0004 D6), so a free list of any length needs one slot. The file must
+already be large enough.
+*/
 @(private)
-freelist_write :: proc(buf: []byte, pgno: Pgno, pages: int, state: Free_State) {
-	h := page_header(buf)
-	h^ = {}
-	h.pgno = u64le(pgno)
-	h.flags = PAGE_FREELIST
-	h.overflow_count = u32le(pages)
+freelist_write :: proc(txn: ^Txn, pgno: Pgno, pages: int, state: Free_State) -> Error {
+	env := txn.env
+	ps := env.page_size
+	slot := pool_alloc(&env.pool, 1, txn.mods) or_return
+	defer pool_free(&env.pool, slot, 1)
+	buf := pool_pages(&env.pool, slot, 1)
+	per_page := ps / size_of(Free_Record)
+	records := ([^]Free_Record)(raw_data(buf))[:per_page]
 
-	count := free_state_count(state)
-	records := ([^]Free_Record)(&buf[PAGE_HEADER_SIZE])[:count]
-	for p, i in state.ready {
-		records[i] = {pgno = u64le(p)}
+	// Records run on from offset PAGE_HEADER_SIZE across the pages, so on
+	// every page they start at a record boundary: the first page's header
+	// takes the place of its first record.
+	#assert(PAGE_HEADER_SIZE == size_of(Free_Record))
+	ready, pending := state.ready[:], state.pending[:]
+	for i in 0 ..< pages {
+		mem.zero_slice(buf)
+		r := 0
+		if i == 0 {
+			h := page_header(buf)
+			h.pgno = u64le(pgno)
+			h.flags = PAGE_FREELIST
+			h.overflow_count = u32le(pages)
+			r = 1
+		}
+		for ; r < per_page && len(ready) > 0; r += 1 {
+			records[r] = {pgno = u64le(ready[0])}
+			ready = ready[1:]
+		}
+		n := copy(records[r:], pending)
+		pending = pending[n:]
+		os_pwrite(env.fd, buf, (i64(pgno) + i64(i)) * i64(ps)) or_return
 	}
-	copy(records[len(state.ready):], state.pending[:])
-	mem.zero_slice(buf[PAGE_HEADER_SIZE + count * size_of(Free_Record):])
+	assert(len(ready) == 0 && len(pending) == 0, "free list longer than its run")
+	return .None
 }

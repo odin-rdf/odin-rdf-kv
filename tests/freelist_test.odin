@@ -227,12 +227,17 @@ release_before :: proc(want: ^Expected_Free, s: u64le) {
 	slice.sort(want.ready[:])
 }
 
-// Every page a write transaction has written so far, overflow runs
-// included (temp allocator).
+// Every page a write transaction has written so far, overflow runs and
+// spilled pages included (temp allocator).
 dirty_pages :: proc(txn: ^kv.Txn) -> []kv.Pgno {
 	pages := make([dynamic]kv.Pgno, context.temp_allocator)
 	for pgno, d in txn.write.dirty {
 		for i in 0 ..< int(d.pages) {
+			append(&pages, pgno + kv.Pgno(i))
+		}
+	}
+	for pgno, n in txn.write.spilled {
+		for i in 0 ..< int(n) {
 			append(&pages, pgno + kv.Pgno(i))
 		}
 	}
@@ -830,6 +835,55 @@ test_freelist_run_length_fits_its_records :: proc(t: ^testing.T) {
 			kv.env_close(env)
 		}
 		temp_dir_destroy(&dir, DB)
+	}
+}
+
+// A free list whose run is longer than the smallest dirty-page pool
+// commits: the run is written a page at a time through one slot (KV-I-0004
+// D6), in reusable pages (consecutive ones) or at the end of the file
+// (scattered ones), and reads back and opens again.
+@(test)
+test_freelist_longer_than_pool :: proc(t: ^testing.T) {
+	RECORDS :: 15_000
+	for stride in 1 ..= 2 {
+		dir := temp_dir_create(t)
+		defer temp_dir_destroy(&dir, DB)
+		path := temp_dir_file(dir, DB)
+		last := kv.Pgno(2 + stride * RECORDS + 100)
+		env, err := open_hand_list(t, path, {records = ready_records(2, RECORDS, stride), run = last - 70, count = -1, overflow_count = -1, last_pgno = last, options = {dirty_budget = MIN_DIRTY_BUDGET}})
+		testing.expectf(t, err == .None, "stride %d: env_open returned %v", stride, err)
+		if err != .None {
+			continue
+		}
+		txn, _ := kv.txn_begin(env, read_only = false)
+		testing.expect_value(t, kv.put(&txn, transmute([]byte)string("k"), transmute([]byte)string("v")), kv.Error.None)
+		testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
+		snap := kv.env_snapshot(env)
+		pages := freelist_run_len(t, env, snap)
+		testing.expectf(t, pages > kv.MIN_DIRTY_PAGES, "stride %d: a run of only %d pages", stride, pages)
+		testing.expectf(t, (snap.freelist_pgno <= last) == (stride == 1), "stride %d: run at %d, last_pgno was %d", stride, snap.freelist_pgno, last)
+		disk := read_freelist(t, env, snap)
+		ok := len(disk) == len(env.free.ready) + len(env.free.pending)
+		for r, i in disk {
+			if !ok {
+				break
+			}
+			if i < len(env.free.ready) {
+				ok = r == kv.Free_Record{pgno = u64le(env.free.ready[i])}
+			} else {
+				ok = r == env.free.pending[i - len(env.free.ready)]
+			}
+		}
+		testing.expectf(t, ok, "stride %d: the run on disk differs from the free list", stride)
+		// The hand-written database leaves pages unlisted, so space_check
+		// doesn't apply; the list is validated when it is loaded again.
+		kv.env_close(env)
+		env, err = kv.env_open(path)
+		testing.expectf(t, err == .None, "stride %d: reopening returned %v", stride, err)
+		if err == .None {
+			testing.expect_value(t, len(env.free.ready) + len(env.free.pending), int(snap.freelist_count))
+			kv.env_close(env)
+		}
 	}
 }
 

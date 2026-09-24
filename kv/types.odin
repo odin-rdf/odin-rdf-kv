@@ -28,10 +28,10 @@ Error :: enum u8 {
 	Locked,
 	// An option or argument is out of range, such as an invalid page size.
 	Invalid_Argument,
-	// Memory couldn't be allocated: the dirty-page pool has too few free
-	// slots for a write transaction's dirty pages (Options.dirty_budget),
-	// or memory for the environment, its reader table or a write
-	// transaction's page lists couldn't be allocated.
+	// Memory couldn't be allocated: for the environment, its reader table
+	// or a write transaction's page lists, or the dirty-page pool's memory
+	// couldn't be committed. (The pool's size never limits put or del:
+	// it spills instead.)
 	Out_Of_Memory,
 }
 

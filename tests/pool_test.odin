@@ -8,8 +8,9 @@ import "core:time"
 import kv "../kv"
 
 // The dirty-page pool (KV-I-0004 D1, KV-T-0020): its budget, the live
-// figures in env_stats, the release of its memory when a write transaction
-// ends, and Out_Of_Memory for a transaction that doesn't fit.
+// figures in env_stats, and the release of its memory when a write
+// transaction ends. Spilling, which keeps a transaction of any size within
+// the pool, is in spill_test.odin.
 
 // Options.dirty_budget: 0 is the default, other values are rounded up to
 // whole pages of the database's own page size, and fewer than
@@ -76,10 +77,9 @@ test_dirty_budget_options :: proc(t: ^testing.T) {
 	}
 }
 
-// dirty_pages counts the slots the writer holds, runs included, while the
-// transaction runs; slots of a page dropped within the transaction are free
-// again; every slot is page-aligned and a run's slots are consecutive; and
-// commit and abort both leave nothing in use and nothing committed.
+// dirty_pages counts the slots the writer holds while the transaction runs;
+// every slot is page-aligned; an overflow run takes no slot once written;
+// and commit and abort both leave nothing in use and nothing committed.
 @(test)
 test_dirty_pages_live :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
@@ -116,26 +116,20 @@ test_dirty_pages_live :: proc(t: ^testing.T) {
 	root := txn.write.dirty[txn.snapshot.root]
 	testing.expect_value(t, env.pool.touched[root.slot], txn.mods)
 
-	// An overflow run takes consecutive slots, and gives them back when
-	// the value is replaced in the same transaction.
+	// An overflow run is written straight to the file (KV-I-0004 D5): it
+	// holds no slot, and its value is read from the map.
 	big := transmute([]byte)string("big")
 	value := patterned(5 * ps, 1)
+	before := kv.env_stats(env).dirty_pages
 	testing.expect_value(t, kv.put(&txn, big, value), kv.Error.None)
+	testing.expect_value(t, kv.env_stats(env).dirty_pages, before)
 	got, _ := kv.get(&txn, big)
 	testing.expect(t, bytes.equal(got, value), "overflow value differs")
 	testing.expect_value(t, uintptr(raw_data(got)) % 16, 0)
-	run_pgno := kv.Pgno(0)
-	for pgno, d in txn.write.dirty {
-		if int(d.pages) == kv.overflow_pages(ps, len(value)) {
-			run_pgno = pgno
-		}
+	testing.expect(t, uintptr(raw_data(got)) >= uintptr(env.map_base) && uintptr(raw_data(got)) < uintptr(env.map_base) + uintptr(env.map_size), "overflow value not in the map")
+	for _, d in txn.write.dirty {
+		testing.expect_value(t, d.pages, 1)
 	}
-	testing.expect(t, run_pgno != 0, "no dirty run of the value's length")
-	expect_live(t, &txn)
-	before := kv.env_stats(env).dirty_pages
-	testing.expect_value(t, kv.put(&txn, big, transmute([]byte)string("small")), kv.Error.None)
-	testing.expect(t, run_pgno not_in txn.write.dirty, "replaced run still dirty")
-	testing.expect_value(t, kv.env_stats(env).dirty_pages, before - kv.overflow_pages(ps, len(value)))
 	expect_live(t, &txn)
 
 	testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
@@ -159,7 +153,9 @@ test_dirty_pages_live :: proc(t: ^testing.T) {
 
 // The pool's memory leaves the process when the write transaction ends,
 // by commit or by abort: the OS reports none of the pool's pages resident
-// afterwards (/proc/self/pagemap on Linux, mach_vm_region on macOS).
+// afterwards (/proc/self/pagemap on Linux, mach_vm_region on macOS). The
+// transaction fills 3 MiB of the pool with small values; a large value
+// would go straight to the file.
 @(test)
 test_dirty_pool_released :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
@@ -173,9 +169,16 @@ test_dirty_pool_released :: proc(t: ^testing.T) {
 	defer kv.env_close(env)
 	SIZE :: 3 << 20
 
+	fill :: proc(t: ^testing.T, txn: ^kv.Txn, size: int) {
+		key: [8]byte
+		for i := 0; kv.env_stats(txn.env).dirty_pages * txn.env.page_size < size; i += 1 {
+			testing.expect_value(t, kv.put(txn, u64_key(&key, u64(i)), patterned(1000, u32(i))), kv.Error.None)
+		}
+		testing.expect_value(t, kv.env_stats(txn.env).spills, 0)
+	}
 	for commit in ([]bool{true, false}) {
 		txn, _ := kv.txn_begin(env, read_only = false)
-		testing.expect_value(t, kv.put(&txn, transmute([]byte)string("big"), patterned(SIZE, 3)), kv.Error.None)
+		fill(t, &txn, SIZE)
 		resident := pool_resident(env)
 		testing.expectf(t, resident >= SIZE, "%d bytes of the pool resident during the transaction, want at least %d", resident, SIZE)
 		testing.expect(t, kv.env_stats(env).dirty_committed >= SIZE, "committed bytes not reported")
@@ -198,84 +201,12 @@ test_dirty_pool_released :: proc(t: ^testing.T) {
 	// The released pool is usable again.
 	txn, _ := kv.txn_begin(env, read_only = false)
 	defer kv.txn_abort(&txn)
-	value := patterned(SIZE, 4)
 	start := time.tick_now()
-	testing.expect_value(t, kv.put(&txn, transmute([]byte)string("big"), value), kv.Error.None)
-	log.infof("put of %d KiB into the released pool (faults included): %.1f µs", SIZE >> 10, time.duration_microseconds(time.tick_since(start)))
-	got, _ := kv.get(&txn, transmute([]byte)string("big"))
-	testing.expect(t, bytes.equal(got, value), "value differs after the pool was released")
-}
-
-// A transaction whose pages don't fit in the pool gets Out_Of_Memory from
-// put, which changes nothing: the transaction goes on, and commits or
-// aborts cleanly.
-@(test)
-test_dirty_pool_exceeded :: proc(t: ^testing.T) {
-	dir := temp_dir_create(t)
-	defer temp_dir_destroy(&dir, DB)
-
-	// A value larger than the whole pool.
-	{
-		env, txn, ok := open_write(t, temp_dir_file(dir, DB))
-		if !ok {
-			return
-		}
-		defer kv.env_close(env)
-		defer kv.txn_abort(&txn)
-		testing.expect_value(t, kv.put(&txn, transmute([]byte)string("small"), transmute([]byte)string("x")), kv.Error.None)
-		testing.expect_value(t, kv.put(&txn, transmute([]byte)string("big"), patterned(kv.DEFAULT_DIRTY_BUDGET + 1, 5)), kv.Error.Out_Of_Memory)
-		testing.expect_value(t, txn.err, kv.Error.None)
-		testing.expect_value(t, kv.env_stats(env).dirty_pages, 1)
-		testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
-
-		r, _ := kv.txn_begin(env)
-		defer kv.txn_abort(&r)
-		_, get_err := kv.get(&r, transmute([]byte)string("big"))
-		testing.expect_value(t, get_err, kv.Error.Not_Found)
-		v, _ := kv.get(&r, transmute([]byte)string("small"))
-		testing.expect_value(t, string(v), "x")
-		expect_space_ok(t, &r)
-	}
-
-	// Many puts into the smallest pool, until one doesn't fit; then abort,
-	// and the database is as it was.
-	env, err := kv.env_open(temp_dir_file(dir, DB), kv.Options{dirty_budget = kv.MIN_DIRTY_PAGES * kv.DEFAULT_PAGE_SIZE})
-	testing.expect_value(t, err, kv.Error.None)
-	if err != .None {
-		return
-	}
-	defer kv.env_close(env)
-	txn, _ := kv.txn_begin(env, read_only = false)
+	fill(t, &txn, SIZE)
+	log.infof("puts filling %d KiB of the released pool (faults included): %.1f µs", SIZE >> 10, time.duration_microseconds(time.tick_since(start)))
 	key: [8]byte
-	put_err := kv.Error.None
-	n := 0
-	for ; n < 100_000; n += 1 {
-		put_err = kv.put(&txn, u64_key(&key, u64(n)), patterned(500, u32(n)))
-		if put_err != .None {
-			break
-		}
-		testing.expect(t, kv.env_stats(env).dirty_pages <= kv.MIN_DIRTY_PAGES, "more pages dirty than the pool has")
-	}
-	testing.expect_value(t, put_err, kv.Error.Out_Of_Memory)
-	testing.expect(t, n > 0, "nothing fit")
-	testing.expect_value(t, txn.err, kv.Error.None)
-	v, get_err := kv.get(&txn, u64_key(&key, u64(n - 1)))
-	testing.expect(t, get_err == .None && bytes.equal(v, patterned(500, u32(n - 1))), "last put lost")
-	kv.txn_abort(&txn)
-	s := kv.env_stats(env)
-	testing.expect(t, s.dirty_pages == 0 && s.dirty_committed == 0, "pool in use after the abort")
-
-	r, _ := kv.txn_begin(env)
-	testing.expect_value(t, r.snapshot.entries, 1)
-	kv.txn_abort(&r)
-
-	// A transaction that fits commits.
-	txn, _ = kv.txn_begin(env, read_only = false)
-	for i in 0 ..< n / 2 {
-		testing.expect_value(t, kv.put(&txn, u64_key(&key, u64(i)), patterned(500, u32(i))), kv.Error.None)
-	}
-	testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
-	expect_latest_ok(t, env)
+	got, _ := kv.get(&txn, u64_key(&key, 7))
+	testing.expect(t, bytes.equal(got, patterned(1000, 7)), "value differs after the pool was released")
 }
 
 // Bytes of the pool the OS reports resident in the process.

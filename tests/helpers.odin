@@ -58,7 +58,28 @@ dirty_buf :: proc(txn: ^kv.Txn, pgno: kv.Pgno) -> (buf: []byte, ok: bool) {
 	return txn.env.pool.base[off:off + int(d.pages) * ps], true
 }
 
-// A dirty-page budget for tests whose single transaction writes more than
-// DEFAULT_DIRTY_BUDGET: until spilling (KV-T-0021), a transaction's dirty
-// pages must fit in the pool. The pool is address space until used.
-BIG_DIRTY_BUDGET :: 64 << 20
+// The page numbers a write transaction has written so far, one per dirty or
+// spilled page or run (its first page), in no particular order (temp
+// allocator).
+written_pgnos :: proc(txn: ^kv.Txn) -> []kv.Pgno {
+	pages := make([dynamic]kv.Pgno, 0, len(txn.write.dirty) + len(txn.write.spilled), context.temp_allocator)
+	for pgno in txn.write.dirty {
+		append(&pages, pgno)
+	}
+	for pgno in txn.write.spilled {
+		append(&pages, pgno)
+	}
+	return pages[:]
+}
+
+// The smallest dirty-page budget at the default page size: MIN_DIRTY_PAGES
+// pages, for tests that make a transaction spill again and again.
+MIN_DIRTY_BUDGET :: kv.MIN_DIRTY_PAGES * kv.DEFAULT_PAGE_SIZE
+
+// Checks that the dirty-page pool holds no more pages than its budget, and
+// has committed no more than it reserved.
+expect_pool_within :: proc(t: ^testing.T, env: ^kv.Env, loc := #caller_location) -> bool {
+	s := kv.env_stats(env)
+	return testing.expectf(t, s.dirty_pages <= s.dirty_budget / env.page_size && s.dirty_committed <= env.pool.reserved,
+		"dirty pool over its budget: %d pages, %d bytes committed, budget %d", s.dirty_pages, s.dirty_committed, s.dirty_budget, loc = loc)
+}

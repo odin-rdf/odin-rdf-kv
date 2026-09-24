@@ -42,10 +42,22 @@ Write_State :: struct {
 	// Owns the dirty map and the page lists. The dirty pages themselves are
 	// in Env.pool.
 	arena: virtual.Arena,
-	// Pages written by this transaction, by page number: the pool slot
-	// holding each. An overflow run or the free-list run is stored under its
-	// first page number, in consecutive slots.
+	// Pages written by this transaction and held in the pool, by page
+	// number: the slot holding each. A run allocated in one piece is stored
+	// under its first page number, in consecutive slots.
 	dirty: map[Pgno]Dirty_Page,
+	// Pages written by this transaction that are already in the file, not
+	// in the pool: dirty pages that were spilled, and overflow runs, which
+	// are written directly (KV-I-0004 D4, D5). By first page number, with
+	// the length in pages. A page is in `dirty` or `spilled`, never both.
+	// They are the transaction's own pages like dirty ones: touching one
+	// copies it back into the pool under the same number, and freeing one
+	// makes it loose.
+	spilled: map[Pgno]u32,
+	// Set while put or del changes the tree. Spilling then would free slots
+	// the operation still holds slices into, so pool_make_room refuses to
+	// (KV-I-0004 D2).
+	in_op:   bool,
 	// Pages of the snapshot that this transaction replaced. The commit puts
 	// them on the free list, tagged with its own txn_id.
 	freed: [dynamic]Pgno,
@@ -101,6 +113,7 @@ txn_begin :: proc(env: ^Env, read_only := true) -> (txn: Txn, err: Error) {
 		}
 		arena := virtual.arena_allocator(&w.arena)
 		w.dirty = make(map[Pgno]Dirty_Page, arena)
+		w.spilled = make(map[Pgno]u32, arena)
 		w.freed = make([dynamic]Pgno, arena)
 		w.loose = make([dynamic]Pgno, arena)
 		w.taken = make([dynamic]Pgno, arena)
@@ -192,9 +205,10 @@ write_state_free :: proc(txn: ^Txn) {
 	txn.write = nil
 }
 
-// Returns page `pgno` as seen by the transaction: this transaction's copy if
-// it has written the page, otherwise the committed page in the map. This is
-// the only way the rest of the package reaches a page.
+// Returns page `pgno` as seen by the transaction: this transaction's copy in
+// the pool if it holds the page dirty, otherwise the page in the map (a
+// committed page, or one this transaction spilled). This is the only way the
+// rest of the package reaches a page.
 page_ptr :: #force_inline proc(txn: ^Txn, pgno: Pgno) -> []byte {
 	when ODIN_DEBUG {
 		assert(!txn.done, "transaction already ended")

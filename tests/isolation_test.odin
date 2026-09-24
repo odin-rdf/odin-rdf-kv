@@ -159,6 +159,18 @@ Run with -sanitize:thread.
 */
 @(test)
 test_snapshot_isolation_across_threads :: proc(t: ^testing.T) {
+	snapshot_isolation(t, 0)
+}
+
+// The same with the smallest dirty-page pool, so every commit spills pages
+// to the file under the readers (KV-I-0004 D4).
+@(test)
+test_snapshot_isolation_min_pool :: proc(t: ^testing.T) {
+	snapshot_isolation(t, MIN_DIRTY_BUDGET)
+}
+
+@(private = "file")
+snapshot_isolation :: proc(t: ^testing.T, dirty_budget: int) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, DB)
 
@@ -168,7 +180,7 @@ test_snapshot_isolation_across_threads :: proc(t: ^testing.T) {
 	value_buf := make([]byte, MODEL_MAX_VALUE, context.temp_allocator)
 	ps := kv.DEFAULT_PAGE_SIZE
 
-	env, err := kv.env_open(temp_dir_file(dir, DB), kv.Options{map_size = 4 << 30, dirty_budget = BIG_DIRTY_BUDGET})
+	env, err := kv.env_open(temp_dir_file(dir, DB), kv.Options{map_size = 4 << 30, dirty_budget = dirty_budget})
 	testing.expect_value(t, err, kv.Error.None)
 	if err != .None {
 		return
@@ -202,6 +214,9 @@ test_snapshot_isolation_across_threads :: proc(t: ^testing.T) {
 				return false
 			}
 			model[id] = spec
+			if !expect_pool_within(t, env) {
+				return false
+			}
 		}
 		return kv.txn_commit(&txn) == .None && expect_latest_ok(t, env)
 	}
@@ -327,7 +342,7 @@ test_snapshot_isolation_across_threads :: proc(t: ^testing.T) {
 			model[id] = spec
 			overflow += int(big)
 		}
-		for pgno in txn.write.dirty {
+		for pgno in written_pgnos(&txn) {
 			if pgno <= last {
 				reused += 1
 			}
@@ -360,6 +375,9 @@ test_snapshot_isolation_across_threads :: proc(t: ^testing.T) {
 	testing.expect(t, total >= CHURN_COMMITS, "too few read transactions")
 	testing.expect(t, reused > 10 * CHURN_COMMITS, "too few pages reused")
 	testing.expect_value(t, kv.env_stats(env).readers, 0)
+	if dirty_budget != 0 {
+		testing.expect(t, kv.env_stats(env).spills > 0, "nothing was spilled")
+	}
 
 	reader, _ := kv.txn_begin(env)
 	defer kv.txn_abort(&reader)

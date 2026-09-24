@@ -109,7 +109,7 @@ test_overflow_10mb_value :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, DB)
 
-	env, txn, ok := open_write(t, temp_dir_file(dir, DB), kv.Options{dirty_budget = BIG_DIRTY_BUDGET})
+	env, txn, ok := open_write(t, temp_dir_file(dir, DB))
 	if !ok {
 		return
 	}
@@ -267,17 +267,25 @@ test_overflow_corruption_detected :: proc(t: ^testing.T) {
 	kv.tree_search(&txn, key, &path)
 	e := kv.path_leaf(&path)
 	_, first, _ := kv.leaf_value(kv.page_ptr(&txn, e.pgno), e.idx)
-	h := kv.page_header(kv.page_ptr(&txn, first))
+	// The run was written straight to the file (KV-I-0004 D5), and is read
+	// through the read-only map: damage it in the file.
+	testing.expect(t, first in txn.write.spilled, "the run is not in the file")
+	buf: Page_Buf
+	page := read_page(t, env, first, &buf)
+	h := kv.page_header(page)
 
 	h.overflow_count += 1
+	write_page(t, env, first, page)
 	_, err := kv.get(&txn, key)
 	testing.expect_value(t, err, kv.Error.Corrupted)
 	h.overflow_count -= 1
 
 	h.flags = kv.PAGE_LEAF
+	write_page(t, env, first, page)
 	_, err = kv.get(&txn, key)
 	testing.expect_value(t, err, kv.Error.Corrupted)
 	h.flags = kv.PAGE_OVERFLOW
+	write_page(t, env, first, page)
 
 	_, err = kv.get(&txn, key)
 	testing.expect_value(t, err, kv.Error.None)

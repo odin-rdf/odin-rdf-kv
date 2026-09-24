@@ -535,7 +535,7 @@ test_reuse_full_map :: proc(t: ^testing.T) {
 			}
 			model[i] = 1_000 + round
 		}
-		written += len(txn.write.dirty)
+		written += len(written_pgnos(&txn))
 		if commit_err := kv.txn_commit(&txn); commit_err != .None {
 			testing.expectf(t, false, "round %d: commit: %v", round, commit_err)
 			kv.env_close(env)

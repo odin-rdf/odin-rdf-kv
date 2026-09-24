@@ -17,33 +17,57 @@ The pages come from the first of these with room:
 - the end of the database, which grows by `n` pages.
 
 Returns Map_Full if none of them has room, and Out_Of_Memory if the pool
-has no `n` consecutive free slots.
+has no `n` consecutive free slots. It never spills: it runs inside
+operations, whose slices into dirty pages must stay valid (KV-I-0004 D2).
 */
 page_alloc :: proc(txn: ^Txn, n: int) -> (pgno: Pgno, buf: []byte, err: Error) {
 	w := txn.write
+	pool := &txn.env.pool
 	slot: u32
 	if n == 1 && len(w.loose) > 0 {
-		slot = pool_alloc(&txn.env.pool, n, txn.mods) or_return
+		slot = pool_alloc(pool, n, txn.mods) or_return
 		pgno = pop(&w.loose)
 	} else if idx, found := ready_run_find(txn, n); found {
-		slot = pool_alloc(&txn.env.pool, n, txn.mods) or_return
+		slot = pool_alloc(pool, n, txn.mods) or_return
 		pgno = ready_take(txn, idx, n) or_return
 	} else {
-		return page_alloc_end(txn, n)
+		if end_room(txn) < n {
+			return 0, nil, .Map_Full
+		}
+		slot = pool_alloc(pool, n, txn.mods) or_return
+		pgno = page_take_end(txn, n) or_return
 	}
 	return pgno, dirty_add(txn, pgno, slot, n), .None
 }
 
-// Allocates `n` new pages at the end of the database, as page_alloc does.
+/*
+Takes `n` contiguous page numbers from the same places as page_alloc, in the
+same order, but no pool slots: for pages written straight to the file (an
+overflow run, KV-I-0004 D5), which the caller records in
+Write_State.spilled. Returns Map_Full if none of the places has room.
+*/
 @(private)
-page_alloc_end :: proc(txn: ^Txn, n: int) -> (pgno: Pgno, buf: []byte, err: Error) {
-	if end_room(txn) < n {
-		return 0, nil, .Map_Full
+page_take :: proc(txn: ^Txn, n: int) -> (pgno: Pgno, err: Error) {
+	w := txn.write
+	if n == 1 && len(w.loose) > 0 {
+		return pop(&w.loose), .None
 	}
-	slot := pool_alloc(&txn.env.pool, n, txn.mods) or_return
+	if idx, found := ready_run_find(txn, n); found {
+		return ready_take(txn, idx, n)
+	}
+	return page_take_end(txn, n)
+}
+
+// Takes `n` new page numbers at the end of the database, or returns Map_Full
+// if the map has no room for them.
+@(private)
+page_take_end :: proc(txn: ^Txn, n: int) -> (pgno: Pgno, err: Error) {
+	if end_room(txn) < n {
+		return 0, .Map_Full
+	}
 	pgno = txn.snapshot.last_pgno + 1
 	txn.snapshot.last_pgno += Pgno(n)
-	return pgno, dirty_add(txn, pgno, slot, n), .None
+	return pgno, .None
 }
 
 // Registers the `n` pages at `pgno` as dirty, held in the pool from `slot`,
@@ -203,10 +227,10 @@ pages_available :: proc(txn: ^Txn, singles: int, run := 0) -> bool {
 Drops the `count` pages starting at `pgno`, a single page or an overflow run,
 that the tree no longer uses. Pages of the snapshot are recorded as freed,
 for the free list to release once no reader can see them. Pages this
-transaction wrote (they are in `dirty` under `pgno`) were never seen by
-anyone, so they are discarded and recorded as loose, for page_alloc to
-hand out again (KV-I-0003 D8), and their pool slots are free for the
-transaction's next page_alloc.
+transaction wrote (they are in `dirty` or `spilled` under `pgno`) were never
+seen by anyone, so they are discarded and recorded as loose, for page_alloc
+to hand out again (KV-I-0003 D8, KV-I-0004 D4); a dirty page's pool slots
+are free for the transaction's next page_alloc.
 */
 @(private)
 page_free :: proc(txn: ^Txn, pgno: Pgno, count := 1) {
@@ -217,6 +241,10 @@ page_free :: proc(txn: ^Txn, pgno: Pgno, count := 1) {
 		pool_free(&txn.env.pool, d.slot, d.pages)
 		delete_key(&w.dirty, pgno)
 		list = &w.loose
+	} else if pages, spilled := w.spilled[pgno]; spilled {
+		assert(int(pages) == count, "freeing part of a spilled run")
+		delete_key(&w.spilled, pgno)
+		list = &w.loose
 	}
 	for i in 0 ..< count {
 		append(list, pgno + Pgno(i))
@@ -225,15 +253,30 @@ page_free :: proc(txn: ^Txn, pgno: Pgno, count := 1) {
 
 /*
 Makes the page at `path` level `level` writable and returns it. A page this
-transaction already wrote is returned as is. Otherwise the committed page is
+transaction already holds dirty is returned as is. A page it spilled is
+copied back into a pool slot under the same page number: it is still the
+transaction's own page, so there is no copy-on-write, nothing is freed and
+the parent doesn't change (KV-I-0004 D4). Otherwise the committed page is
 copied to a new page number, the parent (already touched, as touching goes
 top-down) is pointed at the copy, and the path is updated.
 */
 page_touch :: proc(txn: ^Txn, path: ^Path, level: int) -> (page: []byte, err: Error) {
 	e := &path.entries[level]
-	if d, ok := txn.write.dirty[e.pgno]; ok {
-		txn.env.pool.touched[d.slot] = txn.mods
-		return pool_pages(&txn.env.pool, d.slot, 1), .None
+	w := txn.write
+	pool := &txn.env.pool
+	if d, ok := w.dirty[e.pgno]; ok {
+		pool.touched[d.slot] = txn.mods
+		return pool_pages(pool, d.slot, 1), .None
+	}
+	if pages, spilled := w.spilled[e.pgno]; spilled {
+		assert(pages == 1, "touching a spilled run")
+		slot := pool_alloc(pool, 1, txn.mods) or_return
+		buf := pool_pages(pool, slot, 1)
+		// Read through the map before the page is registered as dirty.
+		copy(buf, page_ptr(txn, e.pgno))
+		delete_key(&w.spilled, e.pgno)
+		w.dirty[e.pgno] = Dirty_Page{slot = slot, pages = 1}
+		return buf, .None
 	}
 
 	pgno, buf := page_alloc(txn, 1) or_return
@@ -256,15 +299,18 @@ Stores `value` under `key`, replacing any existing value.
 
 `key` and `value` must not point into this transaction's own pages, such as
 a slice returned by `get` in the same write transaction: the insert moves
-bytes around within those pages. Copy such data first.
+bytes around within those pages, and a page this transaction dropped can be
+reused and overwritten. That holds for a page it spilled to the file as
+much as for one in the dirty-page pool. Copy such data first.
 
 Returns `Map_Full` without changing anything if the worst case of this put
-might not fit in the reusable pages and the room left in the map, and
-`Out_Of_Memory` if it might not fit in the free slots of the dirty-page
-pool (until spilling, KV-T-0021, a transaction's dirty pages must fit in
-Options.dirty_budget). Any other failure after the tree has started to
-change leaves the transaction unusable: later calls return the same error,
-and it can only be aborted.
+might not fit in the reusable pages and the room left in the map. If the
+dirty-page pool has fewer free slots than that worst case, the least
+recently touched dirty pages are first spilled to the file (KV-I-0004 D2),
+so the pool never limits the size of a transaction; if that fails, the
+error (Io) is returned and nothing else has changed. Any other failure
+after the tree has started to change leaves the transaction unusable: later
+calls return the same error, and it can only be aborted.
 */
 put :: proc(txn: ^Txn, key, value: []byte) -> Error {
 	if txn.read_only {
@@ -290,11 +336,14 @@ put :: proc(txn: ^Txn, key, value: []byte) -> Error {
 	if !pages_available(txn, singles, run) {
 		return .Map_Full
 	}
-	if !pool_available(&txn.env.pool, singles, run) {
-		return .Out_Of_Memory
-	}
+	// In the pool, the run needs no slots (it is written straight to the
+	// file) and its header page one only while the path is touched, before
+	// any split: `singles` covers it.
+	pool_make_room(txn, singles) or_return
 
+	txn.write.in_op = true
 	err := put_unchecked(txn, key, value)
+	txn.write.in_op = false
 	if err != .None {
 		txn.err = err
 	}

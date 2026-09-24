@@ -16,6 +16,12 @@ STEADY_KEYS :: 1_000
 STEADY_COMMITS :: #config(KV_STEADY_COMMITS, 10_000)
 #assert(STEADY_COMMITS >= 1_000 && STEADY_COMMITS % 100 == 0)
 
+// The dirty-page budget the steady-state tests open with; 0 is the default
+// (4 MiB). Pass -define:KV_STEADY_DIRTY_BUDGET=200704 (MIN_DIRTY_BUDGET, 49
+// pages) to run them with the smallest pool, where the initial load and
+// many commits spill (KV-I-0004 NFR-004).
+STEADY_DIRTY_BUDGET :: #config(KV_STEADY_DIRTY_BUDGET, 0)
+
 /*
 The plateau, full-map, long-reader and churn tests make thousands of synced
 commits, several minutes per build configuration, so they are not part of
@@ -102,9 +108,7 @@ steady_commit :: proc(t: ^testing.T, env: ^kv.Env, model: []int, round, count: i
 		}
 	}
 	if written != nil {
-		for pgno in txn.write.dirty {
-			append(written, pgno)
-		}
+		append(written, ..written_pgnos(&txn))
 	}
 	if put_growth != nil {
 		put_growth^ += int(txn.snapshot.last_pgno - begin_last)
@@ -260,7 +264,7 @@ steady_state_plateau :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, DB)
 
-	env, err := kv.env_open(temp_dir_file(dir, DB))
+	env, err := kv.env_open(temp_dir_file(dir, DB), kv.Options{dirty_budget = STEADY_DIRTY_BUDGET})
 	testing.expect_value(t, err, kv.Error.None)
 	if err != .None {
 		return
@@ -327,7 +331,7 @@ steady_state_full_map :: proc(t: ^testing.T) {
 	// Load with the default map to measure the data, then reopen with a map
 	// of the data plus the margin.
 	model := make([]int, STEADY_KEYS, context.temp_allocator)
-	env, err := kv.env_open(path)
+	env, err := kv.env_open(path, kv.Options{dirty_budget = STEADY_DIRTY_BUDGET})
 	testing.expect_value(t, err, kv.Error.None)
 	if err != .None {
 		return
@@ -338,7 +342,7 @@ steady_state_full_map :: proc(t: ^testing.T) {
 	kv.env_close(env)
 	commit_pages := STEADY_COMMIT_KEYS * (1 + STEADY_MAX_RUN) + depth + 2
 	margin := 2 * commit_pages + (2 * depth + 1 + STEADY_MAX_RUN)
-	env, err = kv.env_open(path, kv.Options{map_size = (int(data.last_pgno) + 1 + margin) * ps})
+	env, err = kv.env_open(path, kv.Options{map_size = (int(data.last_pgno) + 1 + margin) * ps, dirty_budget = STEADY_DIRTY_BUDGET})
 	testing.expect_value(t, err, kv.Error.None)
 	if err != .None {
 		return
@@ -398,7 +402,7 @@ steady_state_long_reader :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, DB)
 
-	env, err := kv.env_open(temp_dir_file(dir, DB))
+	env, err := kv.env_open(temp_dir_file(dir, DB), kv.Options{dirty_budget = STEADY_DIRTY_BUDGET})
 	testing.expect_value(t, err, kv.Error.None)
 	if err != .None {
 		return
@@ -506,7 +510,7 @@ steady_state_churn :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, DB)
 
-	env, err := kv.env_open(temp_dir_file(dir, DB))
+	env, err := kv.env_open(temp_dir_file(dir, DB), kv.Options{dirty_budget = STEADY_DIRTY_BUDGET})
 	testing.expect_value(t, err, kv.Error.None)
 	if err != .None {
 		return
@@ -572,7 +576,7 @@ steady_state_churn :: proc(t: ^testing.T) {
 			}
 		}
 		if round > COMMITS / 2 {
-			written_late += len(txn.write.dirty)
+			written_late += len(written_pgnos(&txn))
 		}
 		if failed || !commit_ok(t, env, &txn) {
 			kv.txn_abort(&txn)

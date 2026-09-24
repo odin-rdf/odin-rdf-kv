@@ -6,6 +6,10 @@ import "core:slice"
 import "core:sync"
 import "core:sys/posix"
 
+// The file grows by at least this much at a time, or by an eighth of its
+// size if that is more, so that commits rarely need to resize it.
+FILE_GROWTH_MIN :: 1 << 20
+
 // Address space reserved for the map when `Options.map_size` is 0. It only
 // limits how large the database can grow; it isn't memory in use.
 DEFAULT_MAP_SIZE :: 1 << 30
@@ -24,7 +28,8 @@ Options :: struct {
 	// Bytes of memory for a write transaction's dirty pages (KV-I-0004 D1);
 	// 0 means DEFAULT_DIRTY_BUDGET. Rounded up to whole pages, and at least
 	// MIN_DIRTY_PAGES of them. It is address space until a write
-	// transaction uses it, and released when that transaction ends.
+	// transaction uses it, and released when that transaction ends. A
+	// transaction that writes more spills pages to the file early.
 	dirty_budget: int,
 }
 
@@ -56,8 +61,8 @@ Figures about an Env, as returned by env_stats. They are read together
 under one lock, so they describe one instant, but they can be stale as
 soon as env_stats returns. A write transaction in progress shows in none of
 them until it commits, except the dirty-pool figures (dirty_pages,
-dirty_committed), which are live: read atomically while it runs, and not
-necessarily at the same instant as the rest.
+dirty_committed, spills), which are live: read atomically while it runs,
+and not necessarily at the same instant as the rest.
 
 Step 6 (the memory budget) extends this further with the resident
 estimate, spills and evictions; code that builds a Stats should name its
@@ -88,6 +93,10 @@ Stats :: struct {
 	// transaction is open. Commits are in whole OS pages, so with pages
 	// smaller than the OS's this can exceed dirty_pages' bytes. Live.
 	dirty_committed: int,
+	// Pages spilled from the pool to the file before their commit, since
+	// the Env was opened (KV-I-0004 D3). Overflow runs and the free-list
+	// run, which are always written directly, aren't counted. Live.
+	spills:          int,
 }
 
 Env :: struct {
@@ -237,7 +246,31 @@ env_stats :: proc(env: ^Env) -> Stats {
 	stats.dirty_budget = env.pool.slots * env.page_size
 	stats.dirty_pages = sync.atomic_load(&env.pool.in_use)
 	stats.dirty_committed = sync.atomic_load(&env.pool.committed_bytes)
+	stats.spills = sync.atomic_load(&env.pool.spills)
 	return stats
+}
+
+// Grows the file to at least `needed` bytes, in steps of at least
+// FILE_GROWTH_MIN or an eighth of its size, without exceeding the map. The
+// writer calls it before writing past the end of the file: at commit, and
+// when spilling or writing an overflow run before it (KV-I-0004 D4).
+@(private)
+file_grow :: proc(env: ^Env, needed: i64) -> Error {
+	if needed <= env.file_size {
+		return .None
+	}
+	step := max(FILE_GROWTH_MIN, env.file_size / 8)
+	size := max(needed, env.file_size + step)
+	size = min(size, i64(env.map_size))
+	size = (size + i64(env.page_size) - 1) / i64(env.page_size) * i64(env.page_size)
+	assert(size >= needed, "write past the end of the map")
+
+	os_truncate(env.fd, size) or_return
+	env.file_size = size
+	sync.mutex_lock(&env.snapshot_mutex)
+	env.stats.file_pages = int(size) / env.page_size
+	sync.mutex_unlock(&env.snapshot_mutex)
+	return .None
 }
 
 // Copies the sizes of Env.free into Env.stats. The caller is the writer, or

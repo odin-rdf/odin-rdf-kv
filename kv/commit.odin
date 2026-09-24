@@ -4,10 +4,6 @@ import "core:mem/virtual"
 import "core:slice"
 import "core:sync"
 
-// The file grows by at least this much at a time, or by an eighth of its
-// size if that is more, so that commits rarely need to resize it.
-FILE_GROWTH_MIN :: 1 << 20
-
 /*
 Makes the transaction's changes durable and visible to new transactions,
 then ends it. The steps are ordered so that a crash at any point leaves the
@@ -16,11 +12,14 @@ previous commit intact:
 1. Build the new free list and allocate a run for it (see freelist.odin),
    in reusable pages if a run of them fits, otherwise at the end of the
    file.
-2. Grow the file if needed and write every dirty page, the run included.
-   No committed meta page refers to any of them: they are new pages, or
+2. Grow the file if needed, write the free-list run a page at a time, and
+   write every page still dirty in the pool. Pages spilled earlier in the
+   transaction, overflow runs included, are in the file already. No
+   committed meta page refers to any of them: they are new pages, or
    reused ones that were freed before the snapshot the transaction began
    from (whose meta page stays intact) and that no live reader can see.
-3. Sync, so the pages are on disk before anything points at them.
+3. Sync, so the pages, spilled ones included, are on disk before anything
+   points at them.
 4. Write the meta page for txn_id + 1 into the slot the previous commit
    didn't use, then sync it.
 5. Publish the new snapshot to transactions that begin from now on, and
@@ -29,9 +28,10 @@ previous commit intact:
 On failure the transaction is aborted and the error returned; the database
 and the env's free list stay at the previous commit, including the pages
 the transaction took from it. Map_Full here means the free list's run fit
-neither in reusable pages nor in the map (KV-I-0002 D6), and Out_Of_Memory
-that it didn't fit in the free slots of the dirty-page pool. If only the
-final sync fails, the new meta page may or may not have reached the disk:
+neither in reusable pages nor in the map (KV-I-0002 D6). Pages spilled
+before the failure, or before an abort, are left in the file as they are:
+they are free pages of the previous commit, or past its last page, so
+nothing refers to them. If only the final sync fails, the new meta page may or may not have reached the disk:
 the next open sees whichever state is durable, and this process keeps the
 previous one.
 
@@ -68,13 +68,16 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 	defer if err != .None {
 		free_state_destroy(&next)
 	}
-	run, run_pages, run_buf := freelist_place(txn, &next) or_return
-	if run_pages > 0 {
-		freelist_write(run_buf, run, run_pages, next)
-	}
+	run, run_pages := freelist_place(txn, &next) or_return
 	snap.freelist_pgno, snap.freelist_count = run, u64(free_state_count(next))
 
 	file_grow(env, (i64(snap.last_pgno) + 1) * ps) or_return
+	if run_pages > 0 {
+		// The run needs one slot. Spilling for it costs no extra writes:
+		// every dirty page is written below anyway.
+		pool_make_room(txn, 1) or_return
+		freelist_write(txn, run, run_pages, next) or_return
+	}
 
 	// Write in page order: cheap to do, and it gives the OS sequential I/O.
 	pgnos := make([]Pgno, len(txn.write.dirty), virtual.arena_allocator(&txn.write.arena))
@@ -88,6 +91,8 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 		d := txn.write.dirty[pgno]
 		os_pwrite(env.fd, pool_pages(&env.pool, d.slot, d.pages), i64(pgno) * ps) or_return
 	}
+	// One sync covers every page written in the transaction, spilled ones
+	// included: they were written to the same file.
 	os_sync(env.fd) or_return
 
 	snap.txn_id += 1
@@ -113,27 +118,6 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 	env.snapshot = snap^
 	env.stats.free_ready = len(next.ready)
 	env.stats.free_pending = len(next.pending)
-	sync.mutex_unlock(&env.snapshot_mutex)
-	return .None
-}
-
-// Grows the file to at least `needed` bytes, in steps of at least
-// FILE_GROWTH_MIN or an eighth of its size, without exceeding the map.
-@(private = "file")
-file_grow :: proc(env: ^Env, needed: i64) -> Error {
-	if needed <= env.file_size {
-		return .None
-	}
-	step := max(FILE_GROWTH_MIN, env.file_size / 8)
-	size := max(needed, env.file_size + step)
-	size = min(size, i64(env.map_size))
-	size = (size + i64(env.page_size) - 1) / i64(env.page_size) * i64(env.page_size)
-	assert(size >= needed, "commit past the end of the map")
-
-	os_truncate(env.fd, size) or_return
-	env.file_size = size
-	sync.mutex_lock(&env.snapshot_mutex)
-	env.stats.file_pages = int(size) / env.page_size
 	sync.mutex_unlock(&env.snapshot_mutex)
 	return .None
 }
