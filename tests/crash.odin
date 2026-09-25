@@ -1,10 +1,13 @@
 package kv_tests
 
+import "base:runtime"
 import "core:c"
+import "core:fmt"
 import "core:mem"
 import "core:slice"
 import "core:strings"
 import "core:sys/posix"
+import "core:testing"
 
 import kv "../kv"
 
@@ -221,4 +224,321 @@ journal_image_kill :: proc(b: Baseline, j: Journal, n: int, path: string) -> boo
 		image_apply(&img, r)
 	}
 	return image_write(path, img[:])
+}
+
+// The txn_id of the meta page a recorded operation writes, if it writes one.
+// meta_write writes the page header and the meta and nothing else, so its
+// write has exactly that length; every other write is whole pages.
+record_meta_txn_id :: proc(r: Io_Record) -> (txn_id: u64, ok: bool) {
+	if r.kind != .Write || len(r.bytes) != kv.META_OFFSET + size_of(kv.Meta) {
+		return 0, false
+	}
+	meta: kv.Meta
+	mem.copy(&meta, &r.bytes[kv.META_OFFSET], size_of(kv.Meta))
+	return u64(meta.txn_id), u32(meta.magic) == kv.MAGIC
+}
+
+/*
+The crash sweeps (KV-I-0005 D1, D2, KV-T-0027).
+
+A workload builds a database, takes its baseline (crash_baseline, which
+also starts the journal), makes its commits through crash_put, crash_del
+and crash_commit, and ends with crash_finish. What it leaves in a Crash_Run
+is everything a sweep needs: the baseline, the journal, and the committed
+model after every commit, indexed by txn_id. A sweep then builds images of
+the file from the journal, one or more per cut, and checks each with
+crash_image_check against the states it is allowed to open at:
+
+- a process kill after the first n operations (crash_sweep_kill): exactly
+  crash_kill_txn(run, n), the commit whose meta-page write is the last one
+  among them, or the baseline if there is none;
+- a power loss (KV-T-0028): crash_synced_txn(run, n), the last commit whose
+  meta page was followed by a sync, or its successor if that successor's
+  meta-page write is in the image whole.
+
+Every workload commit is on the thread and the env the journal records,
+and the model is the store's contents key by key (see model.odin), so the
+check is model_diff, plus space_check, one more commit and a reopen.
+*/
+Crash_Run :: struct {
+	name:      string,
+	ks:        Key_Space,
+	// The state being built: crash_put and crash_del change it as they
+	// change the store, crash_commit copies it.
+	model:     Model,
+	// Bumped by every crash_put, so no two values are the same.
+	version:   u32,
+	// Largest value the store has held, for sizing value buffers.
+	max_value: int,
+	page_size: int,
+	base:      Baseline,
+	journal:   Journal,
+	// The txn_id of the baseline's snapshot.
+	base_txn:  kv.Txn_Id,
+	// states[i] is the committed state of txn base_txn + i: states[0] the
+	// baseline's, then one per workload commit.
+	states:    [dynamic]Model,
+	commits:   [dynamic]Crash_Commit,
+	// env_stats' spills when the last commit returned.
+	spills:    int,
+	value_buf: []byte,
+}
+
+// One workload commit.
+Crash_Commit :: struct {
+	txn_id:    kv.Txn_Id,
+	// Its operations in the journal, [first, end): from the end of the
+	// previous commit, so pages spilled and overflow runs written before
+	// the commit are its own.
+	first:     int,
+	end:       int,
+	// The last page of the snapshot the transaction began from: a write at
+	// or below it (and past the meta pages) is into a reused page.
+	prev_last: kv.Pgno,
+	// Pages spilled by the transaction.
+	spills:    int,
+}
+
+crash_run_init :: proc(run: ^Crash_Run, name: string, ks: Key_Space) {
+	run^ = {
+		name  = name,
+		ks    = ks,
+		model = make(Model, len(ks.keys)),
+	}
+}
+
+crash_run_destroy :: proc(run: ^Crash_Run) {
+	journal_destroy(&run.journal)
+	baseline_destroy(&run.base)
+	for m in run.states {
+		delete(m)
+	}
+	delete(run.states)
+	delete(run.commits)
+	delete(run.model)
+	delete(run.value_buf)
+	run^ = {}
+}
+
+// Puts key `id` with a new value of `size` bytes, and records it in the
+// model if the put succeeds.
+crash_put :: proc(txn: ^kv.Txn, run: ^Crash_Run, id: int, size: int) -> kv.Error {
+	run.version += 1
+	spec := Val_Spec{present = true, version = run.version, size = size}
+	value := model_value(id, spec, make([]byte, size, context.temp_allocator))
+	kv.put(txn, run.ks.keys[id], value) or_return
+	run.model[id] = spec
+	run.max_value = max(run.max_value, size)
+	return .None
+}
+
+// Deletes key `id`, and records it in the model if the delete succeeds.
+crash_del :: proc(txn: ^kv.Txn, run: ^Crash_Run, id: int) -> kv.Error {
+	kv.del(txn, run.ks.keys[id]) or_return
+	run.model[id] = {}
+	return .None
+}
+
+/*
+Takes the baseline: the file at `path` as the last commit of `env` left
+it, its txn_id and the model's state. Then starts the journal on this
+thread, so everything the workload does from here is recorded. The env
+must be open on this thread with no transaction.
+*/
+crash_baseline :: proc(t: ^testing.T, run: ^Crash_Run, env: ^kv.Env, path: string) -> bool {
+	ok: bool
+	run.base, ok = baseline_take(path)
+	if !testing.expectf(t, ok && run.base.exists, "%s: taking the baseline", run.name) {
+		return false
+	}
+	run.base_txn = kv.env_snapshot(env).txn_id
+	run.page_size = env.page_size
+	run.spills = kv.env_stats(env).spills
+	append(&run.states, slice.clone(run.model))
+	journal_start(&run.journal)
+	return true
+}
+
+// Commits a workload transaction and records the state it committed.
+crash_commit :: proc(t: ^testing.T, run: ^Crash_Run, env: ^kv.Env, txn: ^kv.Txn, loc := #caller_location) -> bool {
+	prev_last := kv.env_snapshot(env).last_pgno
+	err := kv.txn_commit(txn)
+	if !testing.expectf(t, err == .None, "%s: commit %d: %v", run.name, len(run.commits) + 1, err, loc = loc) {
+		return false
+	}
+	snap := kv.env_snapshot(env)
+	want := run.base_txn + kv.Txn_Id(len(run.states))
+	if !testing.expectf(t, snap.txn_id == want, "%s: committed txn %d, want %d", run.name, snap.txn_id, want, loc = loc) {
+		return false
+	}
+	spills := kv.env_stats(env).spills
+	first := 0 if len(run.commits) == 0 else run.commits[len(run.commits) - 1].end
+	append(&run.commits, Crash_Commit{snap.txn_id, first, len(run.journal.ops), prev_last, spills - run.spills})
+	run.spills = spills
+	append(&run.states, slice.clone(run.model))
+	return true
+}
+
+// Closes the workload's env and stops the journal.
+crash_finish :: proc(run: ^Crash_Run, env: ^kv.Env) {
+	kv.env_close(env)
+	journal_stop()
+	run.value_buf = make([]byte, max(run.max_value, 1))
+}
+
+// The committed state of `txn_id`, if the run has it.
+crash_state :: proc(run: ^Crash_Run, txn_id: kv.Txn_Id) -> (m: Model, ok: bool) {
+	if txn_id < run.base_txn || int(txn_id - run.base_txn) >= len(run.states) {
+		return nil, false
+	}
+	return run.states[txn_id - run.base_txn], true
+}
+
+// The state a process kill after the first `n` operations of the journal
+// leaves: the txn_id of the last meta-page write among them, or the
+// baseline's. A kill loses nothing a write handed to the OS, so a meta page
+// written is a commit made, synced or not.
+crash_kill_txn :: proc(run: ^Crash_Run, n: int) -> kv.Txn_Id {
+	#reverse for r in run.journal.ops[:n] {
+		if id, ok := record_meta_txn_id(r); ok {
+			return kv.Txn_Id(id)
+		}
+	}
+	return run.base_txn
+}
+
+// The last commit durable after the first `n` operations whatever a power
+// loss does to the writes after them: the txn_id of the last meta-page
+// write followed by a sync among them, or the baseline's.
+crash_synced_txn :: proc(run: ^Crash_Run, n: int) -> kv.Txn_Id {
+	synced := false
+	#reverse for r in run.journal.ops[:n] {
+		if r.kind == .Sync {
+			synced = true
+		} else if id, ok := record_meta_txn_id(r); ok && synced {
+			return kv.Txn_Id(id)
+		}
+	}
+	return run.base_txn
+}
+
+// The key crash_image_check's extra commit changes, and its new value.
+@(private = "file")
+CRASH_EXTRA_ID :: 0
+@(private = "file")
+CRASH_EXTRA :: Val_Spec{present = true, version = max(u32), size = 64}
+
+/*
+Checks the database image at `path` (closed): env_open succeeds, at one of
+the `allowed` txn_ids; what it holds is that commit's state, key by key and
+in scans both ways (model_diff, which includes tree_check); space_check
+passes; one more commit succeeds; and a reopen is at that commit, holding
+the state it made. Failures name the run and `what` (the cut). Returns
+false on the first failure.
+*/
+crash_image_check :: proc(t: ^testing.T, run: ^Crash_Run, path: string, allowed: []kv.Txn_Id, what: string, loc := #caller_location) -> bool {
+	env, err := kv.env_open(path)
+	if !testing.expectf(t, err == .None, "%s, %s: env_open: %v", run.name, what, err, loc = loc) {
+		return false
+	}
+	txn_id := kv.env_snapshot(env).txn_id
+	state, known := crash_state(run, txn_id)
+	if !testing.expectf(t, known && slice.contains(allowed, txn_id), "%s, %s: opened at txn %d, allowed %v", run.name, what, txn_id, allowed, loc = loc) {
+		kv.env_close(env)
+		return false
+	}
+	if diff := crash_state_diff(env, run, state); diff != "" {
+		testing.expectf(t, false, "%s, %s: txn %d: %s", run.name, what, txn_id, diff, loc = loc)
+		kv.env_close(env)
+		return false
+	}
+
+	// One more commit, on whatever free list the image left.
+	next := slice.clone(state, context.temp_allocator)
+	next[CRASH_EXTRA_ID] = CRASH_EXTRA
+	txn, _ := kv.txn_begin(env, read_only = false)
+	err = kv.put(&txn, run.ks.keys[CRASH_EXTRA_ID], model_value(CRASH_EXTRA_ID, CRASH_EXTRA, run.value_buf))
+	if err == .None {
+		err = kv.txn_commit(&txn)
+	}
+	kv.txn_abort(&txn)
+	kv.env_close(env)
+	if !testing.expectf(t, err == .None, "%s, %s: the next commit on txn %d: %v", run.name, what, txn_id, err, loc = loc) {
+		return false
+	}
+
+	env, err = kv.env_open(path)
+	if !testing.expectf(t, err == .None, "%s, %s: reopen after the next commit: %v", run.name, what, err, loc = loc) {
+		return false
+	}
+	defer kv.env_close(env)
+	reopened := kv.env_snapshot(env).txn_id
+	if !testing.expectf(t, reopened == txn_id + 1, "%s, %s: reopened at txn %d after committing %d", run.name, what, reopened, txn_id + 1, loc = loc) {
+		return false
+	}
+	if diff := crash_state_diff(env, run, next); diff != "" {
+		testing.expectf(t, false, "%s, %s: after the next commit: %s", run.name, what, diff, loc = loc)
+		return false
+	}
+	return true
+}
+
+// model_diff and space_check on a new read transaction of `env`.
+@(private = "file")
+crash_state_diff :: proc(env: ^kv.Env, run: ^Crash_Run, m: Model) -> string {
+	txn, err := kv.txn_begin(env)
+	if err != .None {
+		return fmt.tprintf("txn_begin: %v", err)
+	}
+	defer kv.txn_abort(&txn)
+	if diff := model_diff(&txn, run.ks, m, run.value_buf); diff != "" {
+		return diff
+	}
+	if ok, reason := kv.space_check(&txn); !ok {
+		return fmt.tprintf("space_check: %s", reason)
+	}
+	return ""
+}
+
+// What a sweep covered.
+Crash_Sweep :: struct {
+	// Images checked.
+	cuts:           int,
+	// Cuts right after a truncate (file growth).
+	after_truncate: int,
+	// Cuts that open at one of the workload's commits, not the baseline.
+	committed:      int,
+}
+
+/*
+Sweeps process kills over the run's journal: for every n from 0 (the
+baseline) to len(ops) (the whole journal), the kill image after the first
+n operations must open at exactly crash_kill_txn(run, n) and pass
+crash_image_check. Stops at the first cut that fails. `path` is the image
+file, rewritten for every cut.
+*/
+crash_sweep_kill :: proc(t: ^testing.T, run: ^Crash_Run, path: string) -> (s: Crash_Sweep, ok: bool) {
+	ops := run.journal.ops[:]
+	img := image_init(run.base)
+	defer delete(img)
+	for n in 0 ..= len(ops) {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		after := "the baseline"
+		if n > 0 {
+			r := ops[n - 1]
+			image_apply(&img, r)
+			after = fmt.tprintf("%v of %d bytes at %d", r.kind, len(r.bytes), r.offset) if r.kind != .Truncate else fmt.tprintf("Truncate to %d", r.size)
+		}
+		if !testing.expectf(t, image_write(path, img[:]), "%s: writing the image", run.name) {
+			return s, false
+		}
+		want := crash_kill_txn(run, n)
+		if !crash_image_check(t, run, path, {want}, fmt.tprintf("kill at cut %d of %d, after %s", n, len(ops), after)) {
+			return s, false
+		}
+		s.cuts += 1
+		s.after_truncate += int(n > 0 && ops[n - 1].kind == .Truncate)
+		s.committed += int(want != run.base_txn)
+	}
+	return s, true
 }

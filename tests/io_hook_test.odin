@@ -71,17 +71,6 @@ hook_put_spread :: proc(txn: ^kv.Txn, n: int) -> kv.Error {
 	return .None
 }
 
-// The txn_id of the meta page a recorded write holds.
-@(private = "file")
-record_meta_txn_id :: proc(r: Io_Record) -> (txn_id: u64, ok: bool) {
-	if r.kind != .Write || len(r.bytes) < kv.META_OFFSET + size_of(kv.Meta) {
-		return 0, false
-	}
-	meta: kv.Meta
-	mem.copy(&meta, &r.bytes[kv.META_OFFSET], size_of(kv.Meta))
-	return u64(meta.txn_id), u32(meta.magic) == kv.MAGIC
-}
-
 /*
 One commit on a committed tree: optionally a truncate (file growth), the
 free-list run and the data pages, the latter in page order, then a sync,
