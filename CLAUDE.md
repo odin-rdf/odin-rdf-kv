@@ -58,6 +58,7 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
   `odin test tests -o:speed -define:KV_CRITERION=true -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_NAMES=kv_tests.test_memory_criterion`, and on Linux `scripts/test-linux.sh arm64 -define:KV_CRITERION=true -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_NAMES=kv_tests.test_memory_criterion`. `-define:KV_CRITERION_SECONDS=n` (default 10) sets the mixed load's length, and `-define:KV_CRITERION_PAUSE_US=n` (default 200) the readers' pause between requests. It logs a `CAPACITY` line per setting.
 - **Platform measurement (KV-T-0019):** `-define:KV_PLATFORM=true` registers `test_platform_residency` and `test_platform_remap_under_load` (run with `-define:ODIN_TEST_THREADS=1`).
 - **Eviction cost:** `odin test tests -o:speed -define:KV_BENCH=true -define:ODIN_TEST_NAMES=kv_tests.test_bench_sweep`.
+- **The I/O hook and the journal (KV-I-0005, KV-T-0026):** `-define:KV_IO_HOOK=true` compiles a call to the thread-local `kv.io_hook` into `os_pwrite`, `os_sync` and `os_truncate` (every write, sync and truncate the store makes); `-define:KV_NO_SYNC=true` makes `os_sync` skip the system call after the hook. Both are test-only. `scripts/test.sh` runs one debug configuration with both; the others keep real syncs. `tests/crash.odin` holds the journal (`journal_start`, `fail_at` for injecting a failure) and crash images (`baseline_take`, `image_apply`, `journal_image_kill`).
 - **Supported targets:** only 64-bit targets are supported (`#assert(size_of(int) == 8)`).
 
 ## Code map

@@ -4,8 +4,17 @@ import "core:c"
 import "core:sys/posix"
 
 // Flushes the file's data, and the metadata needed to read it back (such as
-// its size), to stable storage.
+// its size), to stable storage. Under NO_SYNC (test-only) it returns once
+// io_hook has seen it, without the system call.
 os_sync :: proc(fd: posix.FD) -> Error {
+	when IO_HOOK {
+		if io_hook != nil {
+			io_hook({kind = .Sync, fd = fd}) or_return
+		}
+	}
+	when NO_SYNC {
+		return .None
+	}
 	if posix.fdatasync(fd) != .OK {
 		return .Io
 	}

@@ -22,6 +22,64 @@ foreign libc {
 	flock :: proc(fd: c.int, operation: c.int) -> c.int ---
 }
 
+/*
+Test-only build switches for the crash tests (KV-I-0005 D1, D3). Neither is
+meant for a production build.
+
+IO_HOOK (`-define:KV_IO_HOOK=true`) compiles a call to `io_hook` into
+os_pwrite, os_sync and os_truncate, the only procedures through which the
+store changes the file. Without it the call isn't compiled at all, so a
+production build has no branch.
+
+NO_SYNC (`-define:KV_NO_SYNC=true`) makes os_sync return `.None` without
+the system call, after the hook has seen it. Nothing a test can observe
+depends on a sync other than its cost and its error: a process kill loses
+nothing a write handed to the OS, the crash tests simulate power loss from
+the hook's journal, and a failing sync is injected through the hook. It
+saves the time `F_FULLFSYNC` takes on macOS.
+*/
+IO_HOOK :: #config(KV_IO_HOOK, false)
+NO_SYNC :: #config(KV_NO_SYNC, false)
+
+// The kind of operation in an Io_Op.
+Io_Kind :: enum u8 {
+	// `bytes` written at `offset`.
+	Write,
+	// The file synced to stable storage.
+	Sync,
+	// The file's size set to `size`, growing it with zeros or shrinking it.
+	Truncate,
+}
+
+/*
+An operation on the database file, as io_hook sees it before it is
+performed. `offset` and `bytes` are set for a Write, `size` for a Truncate.
+`bytes` is borrowed: often a slot of the dirty-page pool, which is reused
+once the write returns, so a hook that keeps the bytes must copy them.
+*/
+Io_Op :: struct {
+	kind:   Io_Kind,
+	fd:     posix.FD,
+	offset: i64,
+	bytes:  []byte,
+	size:   i64,
+}
+
+/*
+Test-only (IO_HOOK): when set, called first by os_pwrite, os_sync and
+os_truncate with the operation about to be performed. A return other than
+`.None` is returned by the operation without performing it, which is how a
+test injects a failing write or sync (KV-I-0005 D7).
+
+Thread-local: every write, sync and truncate of a write transaction
+happens on the thread holding it, and those of env_open on the opening
+thread, so a test's hook sees only its own env's operations while other
+tests run in parallel. Declared in every build, so a test file compiles
+without the define; only IO_HOOK builds ever call it.
+*/
+@(thread_local)
+io_hook: proc(op: Io_Op) -> Error
+
 // Same values on Darwin and Linux.
 @(private = "file") LOCK_EX :: 2
 @(private = "file") LOCK_NB :: 4
@@ -64,6 +122,11 @@ os_file_size :: proc(fd: posix.FD) -> (size: i64, err: Error) {
 }
 
 os_truncate :: proc(fd: posix.FD, size: i64) -> Error {
+	when IO_HOOK {
+		if io_hook != nil {
+			io_hook({kind = .Truncate, fd = fd, size = size}) or_return
+		}
+	}
 	for {
 		if posix.ftruncate(fd, posix.off_t(size)) == .OK {
 			return .None
@@ -97,6 +160,11 @@ os_pread :: proc(fd: posix.FD, buf: []byte, offset: i64) -> Error {
 
 // Writes all of `buf` at `offset`.
 os_pwrite :: proc(fd: posix.FD, buf: []byte, offset: i64) -> Error {
+	when IO_HOOK {
+		if io_hook != nil {
+			io_hook({kind = .Write, fd = fd, offset = offset, bytes = buf}) or_return
+		}
+	}
 	buf, offset := buf, offset
 	for len(buf) > 0 {
 		n := posix.pwrite(fd, raw_data(buf), c.size_t(len(buf)), posix.off_t(offset))

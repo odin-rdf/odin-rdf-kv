@@ -9,7 +9,17 @@ F_FULLFSYNC :: 51
 
 // Flushes the file's data to stable storage. On macOS a plain fsync only
 // reaches the drive's cache; F_FULLFSYNC asks the drive to flush it too.
+// Under NO_SYNC (test-only) it returns once io_hook has seen it, without the
+// system call.
 os_sync :: proc(fd: posix.FD) -> Error {
+	when IO_HOOK {
+		if io_hook != nil {
+			io_hook({kind = .Sync, fd = fd}) or_return
+		}
+	}
+	when NO_SYNC {
+		return .None
+	}
 	if posix.fcntl(fd, posix.FCNTL_Cmd(F_FULLFSYNC)) != -1 {
 		return .None
 	}

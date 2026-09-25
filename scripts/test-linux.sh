@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs the test suite (debug and optimised builds) in a Linux container.
+# Runs the test suite (debug and optimised builds, and a debug build with the
+# I/O hook and no syncs, KV-I-0005 D1, D3) in a Linux container.
 # Needs Docker; on macOS that's OrbStack: run `orb start` first and
 # `orb stop` afterwards. amd64 runs under emulation on Apple Silicon.
 #
@@ -19,4 +20,7 @@ for flags in -debug -o:speed; do
 	docker run --rm --platform "linux/${arch}" -v "$PWD":/src:ro "${image}" \
 		odin test tests -vet -strict-style "${flags}" -out:/tmp/kv_tests "$@"
 done
+echo "== linux/${arch} odin test tests -debug -define:KV_IO_HOOK=true -define:KV_NO_SYNC=true $*"
+docker run --rm --platform "linux/${arch}" -v "$PWD":/src:ro "${image}" \
+	odin test tests -vet -strict-style -debug -define:KV_IO_HOOK=true -define:KV_NO_SYNC=true -out:/tmp/kv_tests "$@"
 echo "== linux/${arch} passed"
