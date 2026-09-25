@@ -76,7 +76,7 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 | `write.odin` | `page_alloc` (loose, then reusable, then the end of the file), `page_take` (the same page numbers without pool slots), `pages_available`, `page_free`, `page_touch` (a spilled page comes back under its own number), `put`, splits |
 | `freelist.odin` | Free-list records and run layout, load and validate at open, release at `txn_begin`, build and place at commit, `freelist_write` (a page at a time through one slot, D6) |
 | `overflow.odin` | Overflow value runs; `overflow_write` writes a run straight to the file (D5) |
-| `commit.odin` | `txn_commit` |
+| `commit.odin` | `txn_commit`; `commit_poison` (KV-I-0005 D7) |
 | `delete.odin` | `del`: removal, the rebalance loop (merge with a sibling, drop empty pages) and root collapse |
 | `cursor.odin` | Cursors |
 | `check.odin` | `tree_check`, and `space_check` (every page owned exactly once) |
@@ -112,6 +112,7 @@ scripts/test-linux.sh arm64     # Linux container, debug and -o:speed; also amd6
 - **Dirty pages live in `Env.pool`,** not in the transaction: `page_free` of a dirty page frees its slots for the next `page_alloc`, so don't read a page after freeing it. Every slot is released when the write transaction ends.
 - **Spill only between operations** (KV-I-0004 D2): `pool_make_room` runs at the start of `put` and `del` (with their worst case, next to `pages_available`) and in `txn_commit`, never inside an operation, which holds slices into its dirty pages across `page_alloc`. It asserts `Write_State.in_op`. `page_alloc` never spills.
 - **A page is in `dirty` or `spilled`, never both.** A spilled page (or an overflow run, which is written straight to the file) is still the transaction's own: `page_ptr` reads it through the map, `page_touch` copies it back into a slot under the same number (no copy-on-write, no `freed` entry), and `page_free` makes it loose. Writing it before the commit is safe because pages a write transaction allocates are in no snapshot anyone can read (KV-I-0002 D1); the file is grown (`file_grow`) before anything is written past its end.
+- **A failed first sync, meta-page write or final sync poisons the env** (KV-I-0005 D7): `txn_commit` sets `Env.poisoned` there and nowhere earlier, and every later `txn_begin(rw)` returns `.Poisoned` (checked under `writer_mutex`) until `env_close`; reads, `env_stats` (`Stats.poisoned`) and `env_sweep` carry on. A failure before the first sync leaves only unreferenced pages and doesn't poison. `tests/poison_test.odin` (hooked build) shows the corruption it prevents.
 - **Free pages:** a page freed by commit `T` is reused only once `T ≤ min(oldest reader, S − 1)` (KV-I-0002 D1). `Env.free` changes only at `txn_begin(rw)` (the release) and after a durable commit; a write transaction records what it takes instead.
 
 ## Pitfalls hit so far

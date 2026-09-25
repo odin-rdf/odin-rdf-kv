@@ -68,7 +68,7 @@ soon as env_stats returns. A write transaction in progress shows in none of
 them until it commits, except the dirty-pool figures (dirty_pages,
 dirty_committed, spills) and the resident estimate (resident_chunks,
 chunk_faults and the eviction counts), which are live: read atomically while it runs, and not
-necessarily at the same instant as the rest.
+necessarily at the same instant as the rest. So is poisoned.
 
 Code that builds a Stats should name its fields.
 */
@@ -130,6 +130,10 @@ Stats :: struct {
 	// Bytes of memory the free list of the last commit (Env.free) holds.
 	// Not part of any budget.
 	free_list_bytes:   int,
+	// A commit failed at or after its first sync, and the Env refuses
+	// write transactions until it is closed and reopened (Error.Poisoned,
+	// KV-I-0005 D7). Live.
+	poisoned:          bool,
 }
 
 Env :: struct {
@@ -164,6 +168,10 @@ Env :: struct {
 	// Number of transactions not yet ended, updated atomically. Checked by
 	// env_close in debug builds.
 	active_txns:    int,
+	// Set by txn_commit when its first sync, its meta-page write or its
+	// final sync fails, and never cleared: txn_begin(rw) then returns
+	// Poisoned (KV-I-0005 D7). Written under writer_mutex, read atomically.
+	poisoned:       bool,
 	allocator:      runtime.Allocator,
 }
 
@@ -321,6 +329,7 @@ env_stats :: proc(env: ^Env) -> Stats {
 	stats.sweeps = sync.atomic_load(&env.chunks.sweeps)
 	stats.txn_end_evictions = sync.atomic_load(&env.chunks.txn_end_evictions)
 	stats.inline_evictions = sync.atomic_load(&env.chunks.inline_evictions)
+	stats.poisoned = sync.atomic_load(&env.poisoned)
 	return stats
 }
 

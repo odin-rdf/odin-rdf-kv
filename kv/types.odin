@@ -37,6 +37,13 @@ Error :: enum u8 {
 	// env_resident_check on macOS, which has no per-range source for the
 	// pages mapped into the process (KV-I-0004 D10).
 	Unsupported,
+	// A commit failed after its first sync began (the sync itself, the
+	// meta-page write or the final sync), so the file may hold a meta page
+	// this process never published. Writing on would risk overwriting the
+	// pages it points at, so every later txn_begin(rw) on this Env returns
+	// Poisoned; reads carry on at the last published commit. env_close and
+	// env_open recover from whatever the file holds (KV-I-0005 D7).
+	Poisoned,
 }
 
 // "ODKV" when read as bytes from the start of the meta struct.

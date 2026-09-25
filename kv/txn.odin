@@ -103,9 +103,19 @@ RUN_HINTS :: 8
 // Begins a transaction. Read-only transactions never block and are never
 // blocked by the writer. A read transaction holds its snapshot in the
 // reader table until it ends; one that is never ended pins it forever.
+//
+// A write transaction returns Poisoned once a commit of this Env has failed
+// at or after its first sync (see txn_commit), until the Env is closed and
+// reopened. Read transactions are unaffected.
 txn_begin :: proc(env: ^Env, read_only := true) -> (txn: Txn, err: Error) {
 	if !read_only {
 		sync.mutex_lock(&env.writer_mutex)
+		// Checked under the lock: a writer that was waiting on the commit
+		// that failed must see its flag.
+		if sync.atomic_load(&env.poisoned) {
+			sync.mutex_unlock(&env.writer_mutex)
+			return {}, .Poisoned
+		}
 		w, alloc_err := new(Write_State, env.allocator)
 		if alloc_err != nil {
 			sync.mutex_unlock(&env.writer_mutex)

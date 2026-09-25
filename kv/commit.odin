@@ -31,9 +31,23 @@ the transaction took from it. Map_Full here means the free list's run fit
 neither in reusable pages nor in the map (KV-I-0002 D6). Pages spilled
 before the failure, or before an abort, are left in the file as they are:
 they are free pages of the previous commit, or past its last page, so
-nothing refers to them. If only the final sync fails, the new meta page may or may not have reached the disk:
-the next open sees whichever state is durable, and this process keeps the
-previous one.
+nothing refers to them.
+
+A failure before the first sync (growing the file, writing the free-list
+run or a data page) leaves only such pages written, and the env can take
+the next write transaction as if this one had been aborted.
+
+A failure of the first sync, of the meta-page write (a partial write
+included) or of the final sync poisons the env (KV-I-0005 D7): every later
+txn_begin(rw) returns Poisoned until env_close. After a failed meta-page
+write or final sync, the new meta page may or may not be in the file, and
+may or may not be durable; if it is, it points at pages this process still
+counts as free, and the next write transaction would overwrite them. After
+a failed first sync, the OS may have dropped pages it couldn't write, so
+the file can no longer be vouched for either. Read transactions carry on
+at the previous commit, which this process keeps, and env_stats reports
+the flag. Reopening the file recovers: env_open sees the failed commit if
+its meta page is durable and whole, otherwise the previous one.
 
 Committing a read-only transaction, or a write transaction that changed
 nothing, just ends it. Committing a transaction that failed part-way returns
@@ -92,8 +106,11 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 		os_pwrite(env.fd, pool_pages(&env.pool, d.slot, d.pages), i64(pgno) * ps) or_return
 	}
 	// One sync covers every page written in the transaction, spilled ones
-	// included: they were written to the same file.
-	os_sync(env.fd) or_return
+	// included: they were written to the same file. From here on a failure
+	// poisons the env (D7).
+	if err = os_sync(env.fd); err != .None {
+		return commit_poison(env, err)
+	}
 
 	snap.txn_id += 1
 	meta := Meta {
@@ -108,8 +125,12 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 		freelist_pgno  = u64le(snap.freelist_pgno),
 		freelist_count = u64le(snap.freelist_count),
 	}
-	meta_write(env, int(snap.txn_id & 1), meta) or_return
-	os_sync(env.fd) or_return
+	if err = meta_write(env, int(snap.txn_id & 1), meta); err != .None {
+		return commit_poison(env, err)
+	}
+	if err = os_sync(env.fd); err != .None {
+		return commit_poison(env, err)
+	}
 
 	// Still under writer_mutex, which the transaction holds until it ends.
 	free_state_destroy(&env.free)
@@ -119,4 +140,15 @@ txn_commit :: proc(txn: ^Txn) -> (err: Error) {
 	stats_set_free(env)
 	sync.mutex_unlock(&env.snapshot_mutex)
 	return .None
+}
+
+/*
+Marks the env poisoned after a failure of the commit's first sync, its
+meta-page write or its final sync, and returns `err` (KV-I-0005 D7). The
+caller holds writer_mutex.
+*/
+@(private = "file")
+commit_poison :: proc(env: ^Env, err: Error) -> Error {
+	sync.atomic_store(&env.poisoned, true)
+	return err
 }
