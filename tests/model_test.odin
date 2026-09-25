@@ -18,6 +18,11 @@ Model_Stats :: struct {
 	held_readers, held_commits, reused_pages:                 int,
 	// Pages spilled from the dirty-page pool (Stats.spills at the end).
 	spills:                                                    int,
+	// Transaction ends followed by the full check of the last commit
+	// (every one unless check_every > 1).
+	full_checks:                                               int,
+	// The deepest tree a commit left.
+	max_depth:                                                 int,
 }
 
 // At most this many read transactions are held at once.
@@ -63,9 +68,22 @@ each begins at a random operation, with a copy of the committed model, and
 is released after 1–20 further commits (or before a reopen). On release it
 must still match the model it began at, by model_diff and space_check, so a
 page reused while a reader could still see it is caught.
+
+`check_every` (k) thins the checks for long fuzz runs (KV-I-0005 D5): the
+full check of the last commit (model_compare and space_check on a new
+reader) and the write transaction's space_check before it end every k-th
+transaction (commit or abort) instead of every one, and always before a
+reopen and at the last operation. The check after a reopen and a held
+reader's check on release always run. The checks draw no random numbers,
+so a seed runs the same operations whatever k is, and a failure found at
+k > 1 can be rerun at k = 1 to find the transaction that caused it.
+
+`run_seed` is the seed failure messages show; t.seed by default. A caller
+passing another one has reset context.random_generator to it.
 */
-run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, keys: int, stop_on_map_full := false, max_held := MODEL_HELD_READERS, tides := true) -> (stats: Model_Stats, hit_map_full: bool) {
-	seed := t.seed
+run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, keys: int, stop_on_map_full := false, max_held := MODEL_HELD_READERS, tides := true, check_every := 1, run_seed: Maybe(u64) = nil) -> (stats: Model_Stats, hit_map_full: bool) {
+	assert(check_every >= 1)
+	seed := run_seed.? or_else t.seed
 	ks := key_space_make(keys)
 	committed := make(Model, keys, context.temp_allocator)
 	working := make(Model, keys, context.temp_allocator)
@@ -94,6 +112,8 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 	begin_last: kv.Pgno
 	txn_ops, txn_limit := 0, 0
 	last_reopen := 0
+	// Transactions ended since the last full check.
+	unchecked := 0
 	version: u32
 	// The tide: whether the tree is being emptied, and the commit at which
 	// a rising tide turns.
@@ -157,10 +177,10 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			}
 			if put_err == .Map_Full && stop_on_map_full {
 				kv.txn_abort(&txn)
-				if !held_release(t, held[:], ks, value_buf, &stats, seed, all = true) {
+				if !held_release(t, held[:], ks, value_buf, &stats, seed, op, all = true) {
 					return
 				}
-				return stats, map_full_reopen(t, &env, path, options, ks, committed, value_buf, seed)
+				return stats, map_full_reopen(t, &env, path, options, ks, committed, value_buf, seed, op)
 			}
 			if put_err != .None {
 				testing.expectf(t, false, "[seed %d] op %d: put: %v", seed, op, put_err)
@@ -187,10 +207,10 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			}
 			if del_err == .Map_Full && stop_on_map_full {
 				kv.txn_abort(&txn)
-				if !held_release(t, held[:], ks, value_buf, &stats, seed, all = true) {
+				if !held_release(t, held[:], ks, value_buf, &stats, seed, op, all = true) {
 					return
 				}
-				return stats, map_full_reopen(t, &env, path, options, ks, committed, value_buf, seed)
+				return stats, map_full_reopen(t, &env, path, options, ks, committed, value_buf, seed, op)
 			}
 			want := kv.Error.None if working[id].present else kv.Error.Not_Found
 			if del_err != want {
@@ -253,11 +273,19 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 		if txn_ops < txn_limit && op < ops - 1 {
 			continue
 		}
+		reopen := op - last_reopen >= 10_000
+		unchecked += 1
+		check := unchecked >= check_every || reopen || op == ops - 1
 		// Every page is accounted for in the write transaction too, with
-		// the pages it freed or dropped.
-		if ok, reason := kv.space_check(&txn, context.allocator); !ok {
-			testing.expectf(t, false, "[seed %d] op %d: space_check before commit: %s", seed, op, reason)
-			return
+		// the pages it freed or dropped. It follows k with the check after
+		// the commit: it costs as much, and a page lost or doubled in the
+		// write transaction is still lost or doubled in the commit that
+		// check reads (or, after an abort, was never written).
+		if check {
+			if ok, reason := kv.space_check(&txn, context.allocator); !ok {
+				testing.expectf(t, false, "[seed %d] op %d: space_check before commit: %s", seed, op, reason)
+				return
+			}
 		}
 		if rand.int_max(100) < 85 || op == ops - 1 {
 			for pgno in written_pgnos(&txn) {
@@ -265,13 +293,14 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 					stats.reused_pages += 1
 				}
 			}
+			depth := int(txn.snapshot.depth)
 			commit_err := kv.txn_commit(&txn)
 			if commit_err == .Map_Full && stop_on_map_full {
 				// The commit's free-list run didn't fit (KV-I-0002 D6).
-				if !held_release(t, held[:], ks, value_buf, &stats, seed, all = true) {
+				if !held_release(t, held[:], ks, value_buf, &stats, seed, op, all = true) {
 					return
 				}
-				return stats, map_full_reopen(t, &env, path, options, ks, committed, value_buf, seed)
+				return stats, map_full_reopen(t, &env, path, options, ks, committed, value_buf, seed, op)
 			}
 			if commit_err != .None {
 				testing.expectf(t, false, "[seed %d] op %d: commit: %v", seed, op, commit_err)
@@ -279,6 +308,7 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			}
 			copy(committed, working)
 			stats.commits += 1
+			stats.max_depth = max(stats.max_depth, depth)
 			if model_count(committed) == 0 {
 				stats.empty_commits += 1
 			}
@@ -293,11 +323,14 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 			stats.aborts += 1
 		}
 		in_txn = false
-		if !verify_committed(t, env, ks, committed, value_buf, "after commit/abort", seed) {
-			return
+		if check {
+			if !verify_committed(t, env, ks, committed, value_buf, "after commit/abort", seed, op) {
+				return
+			}
+			unchecked = 0
+			stats.full_checks += 1
 		}
-		reopen := op - last_reopen >= 10_000
-		if !held_release(t, held[:], ks, value_buf, &stats, seed, all = reopen) {
+		if !held_release(t, held[:], ks, value_buf, &stats, seed, op, all = reopen) {
 			return
 		}
 
@@ -310,7 +343,7 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 				env = nil
 				return
 			}
-			if !verify_committed(t, env, ks, committed, value_buf, "after reopen", seed) {
+			if !verify_committed(t, env, ks, committed, value_buf, "after reopen", seed, op) {
 				return
 			}
 			last_reopen = op
@@ -324,18 +357,18 @@ run_model :: proc(t: ^testing.T, path: string, options: kv.Options, ops: int, ke
 // Checks the last commit with a new read transaction: model_compare, then
 // space_check.
 @(private = "file")
-verify_committed :: proc(t: ^testing.T, env: ^kv.Env, ks: Key_Space, m: Model, buf: []byte, phase: string, seed: u64) -> bool {
+verify_committed :: proc(t: ^testing.T, env: ^kv.Env, ks: Key_Space, m: Model, buf: []byte, phase: string, seed: u64, op: int) -> bool {
 	reader, err := kv.txn_begin(env)
 	if err != .None {
-		testing.expectf(t, false, "[seed %d] %s: txn_begin: %v", seed, phase, err)
+		testing.expectf(t, false, "[seed %d] op %d: %s: txn_begin: %v", seed, op, phase, err)
 		return false
 	}
 	defer kv.txn_abort(&reader)
-	if !model_compare(t, &reader, ks, m, buf, phase, seed) {
+	if !model_compare(t, &reader, ks, m, buf, phase, seed, op) {
 		return false
 	}
 	if ok, reason := kv.space_check(&reader, context.allocator); !ok {
-		testing.expectf(t, false, "[seed %d] %s: space_check: %s", seed, phase, reason)
+		testing.expectf(t, false, "[seed %d] op %d: %s: space_check: %s", seed, op, phase, reason)
 		return false
 	}
 	return true
@@ -348,7 +381,7 @@ by `get`, full scans both ways, tree_check and space_check. Its snapshot's
 free-list run and pages must all be intact, whatever was reused since.
 */
 @(private = "file")
-held_release :: proc(t: ^testing.T, held: []Held_Reader, ks: Key_Space, buf: []byte, stats: ^Model_Stats, seed: u64, all: bool) -> bool {
+held_release :: proc(t: ^testing.T, held: []Held_Reader, ks: Key_Space, buf: []byte, stats: ^Model_Stats, seed: u64, op: int, all: bool) -> bool {
 	for &h in held {
 		if h.txn.env == nil || h.txn.done || (!all && h.release > stats.commits) {
 			continue
@@ -357,11 +390,11 @@ held_release :: proc(t: ^testing.T, held: []Held_Reader, ks: Key_Space, buf: []b
 		stats.held_readers += 1
 		stats.held_commits += stats.commits - h.begun
 		phase := "held reader on release"
-		if !model_compare(t, &h.txn, ks, h.model, buf, phase, seed) {
+		if !model_compare(t, &h.txn, ks, h.model, buf, phase, seed, op) {
 			return false
 		}
 		if ok, reason := kv.space_check(&h.txn, context.allocator); !ok {
-			testing.expectf(t, false, "[seed %d] %s: space_check: %s", seed, phase, reason)
+			testing.expectf(t, false, "[seed %d] op %d: %s: space_check: %s", seed, op, phase, reason)
 			return false
 		}
 	}
@@ -371,7 +404,7 @@ held_release :: proc(t: ^testing.T, held: []Held_Reader, ks: Key_Space, buf: []b
 // After a Map_Full with stop_on_map_full: reopens the database and checks
 // that it is still at the last commit. The transaction has already ended.
 @(private = "file")
-map_full_reopen :: proc(t: ^testing.T, env: ^^kv.Env, path: string, options: kv.Options, ks: Key_Space, committed: Model, buf: []byte, seed: u64) -> bool {
+map_full_reopen :: proc(t: ^testing.T, env: ^^kv.Env, path: string, options: kv.Options, ks: Key_Space, committed: Model, buf: []byte, seed: u64, op: int) -> bool {
 	kv.env_close(env^)
 	err: kv.Error
 	env^, err = kv.env_open(path, options)
@@ -380,7 +413,7 @@ map_full_reopen :: proc(t: ^testing.T, env: ^^kv.Env, path: string, options: kv.
 		env^ = nil
 		return false
 	}
-	verify_committed(t, env^, ks, committed, buf, "after Map_Full and reopen", seed)
+	verify_committed(t, env^, ks, committed, buf, "after Map_Full and reopen", seed, op)
 	return true
 }
 

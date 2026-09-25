@@ -184,11 +184,16 @@ lower_bound :: proc(ks: Key_Space, target: []byte) -> int {
 	return lo
 }
 
-// model_diff for the test thread: records a failure with the seed and
-// phase if the transaction differs from the model.
-model_compare :: proc(t: ^testing.T, txn: ^kv.Txn, ks: Key_Space, m: Model, value_buf: []byte, phase: string, seed: u64, loc := #caller_location) -> bool {
+// model_diff for the test thread: records a failure with the seed, the
+// operation (if `op` is given) and the phase if the transaction differs
+// from the model.
+model_compare :: proc(t: ^testing.T, txn: ^kv.Txn, ks: Key_Space, m: Model, value_buf: []byte, phase: string, seed: u64, op := -1, loc := #caller_location) -> bool {
 	if diff := model_diff(txn, ks, m, value_buf); diff != "" {
-		testing.expectf(t, false, "[seed %d] %s: %s", seed, phase, diff, loc = loc)
+		if op >= 0 {
+			testing.expectf(t, false, "[seed %d] op %d: %s: %s", seed, op, phase, diff, loc = loc)
+		} else {
+			testing.expectf(t, false, "[seed %d] %s: %s", seed, phase, diff, loc = loc)
+		}
 		return false
 	}
 	return true
