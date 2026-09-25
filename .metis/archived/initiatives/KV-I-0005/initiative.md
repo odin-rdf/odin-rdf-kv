@@ -4,14 +4,14 @@ level: initiative
 title: "Crash tests and fuzzing"
 short_code: "KV-I-0005"
 created_at: 2026-09-24T22:50:49.319079+00:00
-updated_at: 2026-09-25T09:18:22.992592+00:00
+updated_at: 2026-09-25T12:04:57.308834+00:00
 parent: KV-V-0001
 blocked_by: []
-archived: false
+archived: true
 
 tags:
   - "#initiative"
-  - "#phase/active"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
