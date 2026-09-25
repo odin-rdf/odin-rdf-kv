@@ -237,3 +237,7 @@ Two on-demand modes, never part of the default run:
 - `-define:KV_KILL=true` runs the real-kill test.
 
 The build switches `KV_IO_HOOK` and `KV_NO_SYNC` are for tests only; `KV_NO_SYNC` skips every sync and must never be used in a build that keeps data.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
