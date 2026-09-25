@@ -1,5 +1,8 @@
 package kv_tests
 
+import "core:fmt"
+import "core:slice"
+import "core:strings"
 import "core:testing"
 
 import kv "../kv"
@@ -219,6 +222,119 @@ test_env_truncated_file :: proc(t: ^testing.T) {
 
 	_, err = kv.env_open(path)
 	testing.expect_value(t, err, kv.Error.Corrupted)
+}
+
+// Writes `img` as the file at `path`, failing the test if it can't.
+@(private = "file")
+env_file_write :: proc(t: ^testing.T, path: string, img: []byte) -> bool {
+	return testing.expectf(t, image_write(path, img), "writing %s", path)
+}
+
+// Opens `path`, which must return Corrupted and leave the file as `img`.
+@(private = "file")
+expect_refused :: proc(t: ^testing.T, path: string, img: []byte, what: string, options := kv.Options{}) {
+	env, err := kv.env_open(path, options)
+	if err == .None {
+		kv.env_close(env)
+	}
+	testing.expectf(t, err == .Corrupted, "%s: env_open returned %v, want Corrupted", what, err)
+	b, ok := baseline_take(path, context.temp_allocator)
+	testing.expectf(t, ok && slice.equal(b.bytes, img), "%s: the refused file was changed", what)
+}
+
+// KV-I-0005 D6: a file of exactly two zero pages, at the page size this
+// open would use, is a creation that crashed before either meta page
+// reached it, and opens as a new database.
+@(test)
+test_env_new_file_all_zero :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+	path := strings.clone(temp_dir_file(dir, DB), context.temp_allocator)
+
+	for ps in ([]int{kv.DEFAULT_PAGE_SIZE, 16384}) {
+		options := kv.Options{page_size = ps}
+		if !env_file_write(t, path, make([]byte, 2 * ps, context.temp_allocator)) {
+			return
+		}
+		env, err := kv.env_open(path, options)
+		if !testing.expectf(t, err == .None, "page size %d: env_open: %v", ps, err) {
+			continue
+		}
+		testing.expect_value(t, env.page_size, ps)
+		testing.expect_value(t, kv.env_snapshot(env), kv.Snapshot{txn_id = 0, last_pgno = 1})
+
+		txn, _ := kv.txn_begin(env, read_only = false)
+		testing.expect_value(t, kv.put(&txn, transmute([]byte)string("key"), transmute([]byte)string("value")), kv.Error.None)
+		testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
+		kv.env_close(env)
+
+		env, err = kv.env_open(path, options)
+		if !testing.expectf(t, err == .None, "page size %d: reopen: %v", ps, err) {
+			continue
+		}
+		snap := kv.env_snapshot(env)
+		testing.expect_value(t, snap.txn_id, 1)
+		testing.expect_value(t, snap.entries, 1)
+		reader, _ := kv.txn_begin(env)
+		value, get_err := kv.get(&reader, transmute([]byte)string("key"))
+		testing.expect_value(t, get_err, kv.Error.None)
+		testing.expect_value(t, string(value), "value")
+		kv.txn_abort(&reader)
+		kv.env_close(env)
+	}
+}
+
+// The D6 rule is narrow: anything without a valid meta page that isn't
+// exactly two zero pages at this open's page size stays Corrupted, and is
+// left as it was.
+@(test)
+test_env_new_file_rule_is_narrow :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+	path := strings.clone(temp_dir_file(dir, DB), context.temp_allocator)
+	ps := kv.DEFAULT_PAGE_SIZE
+
+	// One nonzero byte, past the meta pages' prefixes and inside one.
+	for offset in ([]int{2 * ps - 1, ps - 1, kv.META_OFFSET, ps + kv.META_OFFSET + 3}) {
+		img := make([]byte, 2 * ps, context.temp_allocator)
+		img[offset] = 1
+		if env_file_write(t, path, img) {
+			expect_refused(t, path, img, fmt.tprintf("two pages, byte %d nonzero", offset))
+		}
+	}
+
+	// Three zero pages, one zero page, and a zero file of two pages at
+	// another page size than this open's (both ways).
+	cases := []struct {
+		size:      int,
+		page_size: int,
+	}{{3 * ps, 0}, {ps, 0}, {2 * 8192, 0}, {2 * ps, 8192}}
+	for c in cases {
+		img := make([]byte, c.size, context.temp_allocator)
+		if env_file_write(t, path, img) {
+			expect_refused(t, path, img, fmt.tprintf("%d zero bytes opened at page size %d", c.size, c.page_size), {page_size = c.page_size})
+		}
+	}
+
+	// What a power loss during creation can leave with a meta write torn
+	// (KV-T-0029): slot 0 holding a prefix of its meta page, slot 1 zero.
+	// No valid meta page, not all zero: refused, like any other damage.
+	fresh := strings.clone(temp_dir_file(dir, "fresh"), context.temp_allocator)
+	defer file_remove(fresh)
+	env, err := kv.env_open(fresh)
+	if !testing.expect_value(t, err, kv.Error.None) {
+		return
+	}
+	kv.env_close(env)
+	b, ok := baseline_take(fresh, context.temp_allocator)
+	if !testing.expect(t, ok && len(b.bytes) == 2 * ps, "reading a new database") {
+		return
+	}
+	img := make([]byte, 2 * ps, context.temp_allocator)
+	copy(img[:40], b.bytes[:40])
+	if env_file_write(t, path, img) {
+		expect_refused(t, path, img, "slot 0 torn to 40 bytes, slot 1 zero")
+	}
 }
 
 @(test)

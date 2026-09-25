@@ -2,6 +2,7 @@ package kv_tests
 
 import "core:encoding/endian"
 import "core:log"
+import "core:slice"
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -62,6 +63,31 @@ when kv.IO_HOOK {
 	@(test)
 	test_crash_power_reuse :: proc(t: ^testing.T) {
 		crash_power(t, crash_workload_reuse)
+	}
+
+	// Workload 5 (KV-I-0005 D6, KV-T-0029): creation, at the default page
+	// size and at 16 KiB. A kill image is no file, two zero pages, or one
+	// or both meta pages whole: each opens as an empty database.
+	@(test)
+	test_crash_kill_create :: proc(t: ^testing.T) {
+		for w in ([]Crash_Workload{crash_workload_create, crash_workload_create_16k}) {
+			s, ok := crash_kill(t, w)
+			testing.expectf(t, !ok || s.after_truncate == 1, "%d cuts after a truncate, want the one of creation", s.after_truncate)
+		}
+	}
+
+	@(test)
+	test_crash_power_create :: proc(t: ^testing.T) {
+		for w in ([]Crash_Workload{crash_workload_create, crash_workload_create_16k}) {
+			run: Crash_Run
+			start := time.tick_now()
+			s, ok := crash_sweep(t, w, &run, crash_sweep_create_power)
+			log.infof("%s: power loss during creation: %d images, %d refused as Corrupted (%d a torn meta page on two pages, %d with the truncate lost), in %v",
+				run.name, s.images, s.refused_torn + s.refused_short, s.refused_torn, s.refused_short, time.tick_since(start))
+			// Both kinds of refusal occur, and are what the task reports.
+			testing.expectf(t, !ok || (s.refused_torn > 0 && s.refused_short > 0), "%s: no refused image of some kind", run.name)
+			crash_run_destroy(&run)
+		}
 	}
 }
 
@@ -388,4 +414,43 @@ crash_workload_reuse :: proc(t: ^testing.T, path: string, run: ^Crash_Run) -> bo
 		ok &= testing.expectf(t, reused > 0, "commit %d wrote %d pages, none of them reused", i + 1, written)
 	}
 	return ok
+}
+
+/*
+Workload 5: env_open of a path with no file (KV-I-0005 D6). The baseline
+is no file, the state the empty database at txn 0, and the journal
+env_open's truncate, two meta writes and sync. The images are opened at
+the page size the database was created at (Crash_Run.options), since the
+D6 rule is at the page size of the open.
+*/
+@(private = "file")
+crash_workload_create :: proc(t: ^testing.T, path: string, run: ^Crash_Run) -> bool {
+	return crash_create(t, path, run, "create", kv.DEFAULT_PAGE_SIZE)
+}
+
+@(private = "file")
+crash_workload_create_16k :: proc(t: ^testing.T, path: string, run: ^Crash_Run) -> bool {
+	return crash_create(t, path, run, "create 16k", 16384)
+}
+
+@(private = "file")
+crash_create :: proc(t: ^testing.T, path: string, run: ^Crash_Run, name: string, page_size: int) -> bool {
+	crash_run_init(run, name, crash_u64_keys(1))
+	run.options = {page_size = page_size}
+	run.page_size = page_size
+	file_remove(path)
+	ok: bool
+	run.base, ok = baseline_take(path)
+	if !testing.expectf(t, ok && !run.base.exists, "%s: a baseline of no file", name) {
+		return false
+	}
+	append(&run.states, slice.clone(run.model))
+	journal_start(&run.journal)
+	env := crash_open(t, path, run.options) or_else nil
+	if env == nil {
+		journal_stop()
+		return false
+	}
+	crash_finish(run, env)
+	return testing.expectf(t, len(run.journal.ops) == 4, "%s: creation made %d operations, want 4", name, len(run.journal.ops))
 }

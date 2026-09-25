@@ -272,6 +272,10 @@ Crash_Run :: struct {
 	// Largest value the store has held, for sizing value buffers.
 	max_value: int,
 	page_size: int,
+	// What crash_image_check opens images with: the default options, or
+	// the page size a workload created its database at (creation, whose
+	// D6 rule is at the page size of the open).
+	options:   kv.Options,
 	base:      Baseline,
 	journal:   Journal,
 	// The txn_id of the baseline's snapshot.
@@ -388,7 +392,8 @@ crash_commit :: proc(t: ^testing.T, run: ^Crash_Run, env: ^kv.Env, txn: ^kv.Txn,
 crash_finish :: proc(run: ^Crash_Run, env: ^kv.Env) {
 	kv.env_close(env)
 	journal_stop()
-	run.value_buf = make([]byte, max(run.max_value, 1))
+	// Large enough for crash_image_check's extra commit too.
+	run.value_buf = make([]byte, max(run.max_value, CRASH_EXTRA.size))
 }
 
 // Records the model as the state of base_txn − 1: call it before the
@@ -403,7 +408,7 @@ crash_state :: proc(run: ^Crash_Run, txn_id: kv.Txn_Id) -> (m: Model, ok: bool) 
 	if run.pre != nil && txn_id + 1 == run.base_txn {
 		return run.pre, true
 	}
-	if txn_id < run.base_txn || int(txn_id - run.base_txn) >= len(run.states) {
+	if txn_id < run.base_txn || u64(txn_id - run.base_txn) >= u64(len(run.states)) {
 		return nil, false
 	}
 	return run.states[txn_id - run.base_txn], true
@@ -452,7 +457,7 @@ the state it made. Failures name the run and `what` (the cut). Returns
 false on the first failure.
 */
 crash_image_check :: proc(t: ^testing.T, run: ^Crash_Run, path: string, allowed: []kv.Txn_Id, what: string, loc := #caller_location) -> bool {
-	env, err := kv.env_open(path)
+	env, err := kv.env_open(path, run.options)
 	if !testing.expectf(t, err == .None, "%s, %s: env_open: %v", run.name, what, err, loc = loc) {
 		return false
 	}
@@ -482,7 +487,7 @@ crash_image_check :: proc(t: ^testing.T, run: ^Crash_Run, path: string, allowed:
 		return false
 	}
 
-	env, err = kv.env_open(path)
+	env, err = kv.env_open(path, run.options)
 	if !testing.expectf(t, err == .None, "%s, %s: reopen after the next commit: %v", run.name, what, err, loc = loc) {
 		return false
 	}
@@ -529,6 +534,11 @@ Crash_Sweep :: struct {
 	windows:        int,
 	images:         int,
 	corrupt:        int,
+	// A creation sweep's power-loss images that open as no database
+	// (Corrupted, see crash_sweep_create_power): a meta write torn with
+	// nothing whole beside it, or a meta write kept with the sizing lost.
+	refused_torn:   int,
+	refused_short:  int,
 }
 
 /*
@@ -880,4 +890,118 @@ crash_image_meta_corrupt :: proc(t: ^testing.T, run: ^Crash_Run, path: string, n
 	s.corrupt += 1
 	what := fmt.tprintf("meta corruption at cut %d of %d: the meta page of txn %d unreadable", n, len(run.journal.ops), S)
 	return crash_image_check(t, run, path, {S - 1}, what)
+}
+
+/*
+Power losses during creation (KV-I-0005 D6, workload 5, KV-T-0029).
+
+env_open of a new file is one window with no sync before it: truncate to
+two pages, the meta page of slot 0, the meta page of slot 1, sync. There
+is no committed state before it, so the power-loss sweep of commits
+(which expects the synced commit or its successor) doesn't fit; this one
+takes every combination of the truncate taken or not and each meta write
+lost, whole, or torn to a prefix of 1, POWER_META_TORN or all but one of
+its bytes (50 images), then CRASH_SUBSETS random ones. Each image is
+classified by what it is, and must open accordingly:
+
+- no file, or two pages all zero (D6): as an empty database, and pass
+  crash_image_check at txn 0;
+- two pages with a meta write whole in it: the same;
+- anything else, which is a meta write torn with no whole one beside it,
+  or a meta write kept while the truncate was lost (a file shorter than
+  two pages, or one page and a meta prefix): Corrupted. Such a file has
+  no valid meta page and isn't all zero, so D6 refuses it by design. This
+  pins what the store does today; whether a torn creation should open is
+  the owner's question (KV-T-0029's status update). They are counted in
+  refused_torn (two pages long) and refused_short.
+
+The run must hold the creation's journal and nothing else, with states[0]
+the empty database at txn 0.
+*/
+crash_sweep_create_power :: proc(t: ^testing.T, run: ^Crash_Run, path: string) -> (s: Crash_Sweep, ok: bool) {
+	ops := run.journal.ops[:]
+	shape := len(ops) == 4 && ops[0].kind == .Truncate && ops[3].kind == .Sync
+	for i in 1 ..= 2 {
+		if shape {
+			id, is_meta := record_meta_txn_id(ops[i])
+			shape = is_meta && id == 0
+		}
+	}
+	if !testing.expectf(t, shape, "%s: creation is not truncate, two meta writes, sync: %v", run.name, ops) {
+		return s, false
+	}
+	n := len(ops) - 1
+	s.cuts = 1
+	s.windows = 1
+	meta_len := len(ops[1].bytes)
+	// Per meta write: lost (-1), whole (0), or torn to a prefix of that many bytes.
+	fates := []int{-1, 0, 1, POWER_META_TORN, meta_len - 1}
+	for truncate in ([]bool{false, true}) {
+		for f1 in fates {
+			for f2 in fates {
+				runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+				subset := make([dynamic]int, context.temp_allocator)
+				tears := make([dynamic]Io_Tear, context.temp_allocator)
+				if truncate {
+					append(&subset, 0)
+				}
+				for f, k in ([]int{f1, f2}) {
+					if f >= 0 {
+						append(&subset, 1 + k)
+					}
+					if f > 0 {
+						keep := make([][2]int, 1, context.temp_allocator)
+						keep[0] = {0, f}
+						append(&tears, Io_Tear{1 + k, keep})
+					}
+				}
+				if !crash_create_image(t, run, path, n, subset[:], tears[:], "fixed", &s) {
+					return s, false
+				}
+			}
+		}
+	}
+	all := []int{0, 1, 2}
+	for k in 0 ..< CRASH_SUBSETS {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		state := rand.create(t.seed ~ u64(k) << 32)
+		gen := rand.default_random_generator(&state)
+		subset, tears := power_random(ops, all, gen)
+		if !crash_create_image(t, run, path, n, subset, tears, fmt.tprintf("random subset %d", k), &s) {
+			return s, false
+		}
+	}
+	return s, true
+}
+
+// Builds, classifies and checks one power-loss image of creation (see
+// crash_sweep_create_power).
+@(private = "file")
+crash_create_image :: proc(t: ^testing.T, run: ^Crash_Run, path: string, n: int, subset: []int, tears: []Io_Tear, name: string, s: ^Crash_Sweep) -> bool {
+	img := image_power(run.base, run.journal, n, subset, tears, context.temp_allocator)
+	if !testing.expectf(t, image_write(path, img[:]), "%s: writing the image", run.name) {
+		return false
+	}
+	s.images += 1
+	what := fmt.tprintf("power loss [seed %d] during creation, %s: subset %s, tears %s: %d bytes",
+		t.seed, name, power_ranges(subset), power_tears(tears), len(img))
+	two_pages := len(img) == 2 * run.page_size
+	opens := len(img) == 0 || (two_pages && mem.check_zero(img[:]))
+	opens |= two_pages && (image_has(img[:], run.journal.ops[1]) || image_has(img[:], run.journal.ops[2]))
+	if opens {
+		return crash_image_check(t, run, path, {0}, what)
+	}
+	env, err := kv.env_open(path, run.options)
+	if err == .None {
+		kv.env_close(env)
+	}
+	if !testing.expectf(t, err == .Corrupted, "%s, %s: env_open: %v, want Corrupted (no valid meta page, not all zero)", run.name, what, err) {
+		return false
+	}
+	if two_pages {
+		s.refused_torn += 1
+	} else {
+		s.refused_short += 1
+	}
+	return true
 }

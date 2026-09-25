@@ -167,9 +167,20 @@ Env :: struct {
 	allocator:      runtime.Allocator,
 }
 
-// Opens the database at `path`, creating it if the file doesn't exist or is
-// empty. The file stays exclusively locked until env_close. Returns
-// Invalid_Argument for an option out of range.
+/*
+Opens the database at `path`, creating it if the file doesn't exist or is
+empty. The file stays exclusively locked until env_close. Returns
+Invalid_Argument for an option out of range.
+
+A file with no valid meta page is Corrupted, with one exception
+(KV-I-0005 D6): a file of exactly two pages at the page size this open
+would use (Options.page_size, or DEFAULT_PAGE_SIZE), every byte of it
+zero, is what a crash during creation leaves after the file was sized and
+before either meta page reached it, and is initialised as a new database.
+Nothing else is: a damaged database is never replaced by an empty one.
+Creation that tore a meta page, or lost the sizing but not a meta write,
+leaves a file that stays Corrupted (see KV-T-0029).
+*/
 env_open :: proc(path: string, options := Options{}, allocator := context.allocator) -> (env: ^Env, err: Error) {
 	page_size := options.page_size if options.page_size != 0 else DEFAULT_PAGE_SIZE
 	if !page_size_valid(page_size) {
@@ -221,13 +232,19 @@ env_open :: proc(path: string, options := Options{}, allocator := context.alloca
 		chunks_destroy(&e.chunks, allocator)
 	}
 
+	// Both meta pages, at whatever page size meta_choose tries, and the
+	// two pages of the new-file check, are in chunk 0.
+	chunk_touch(e, 0)
 	meta, meta_page_size, found := meta_choose(base[:file_size])
+	if !found && file_size == 2 * i64(page_size) && mem.check_zero(base[:file_size]) {
+		// A creation that crashed before either meta page reached the
+		// file (D6). The map is shared, so it sees the pages written.
+		init_meta_pages(fd, page_size) or_return
+		meta, meta_page_size, found = meta_choose(base[:file_size])
+	}
 	if !found {
 		return nil, .Corrupted
 	}
-	// Both meta pages, at whatever page size meta_choose tried, are in
-	// chunk 0.
-	chunk_touch(e, 0)
 	e.page_size = meta_page_size
 	e.snapshot = snapshot_from_meta(meta)
 	e.free = freelist_load(e, e.snapshot) or_return
