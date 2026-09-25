@@ -87,11 +87,13 @@ One steady-state commit: overwrites `count` random keys (every key when
 and once it has committed records the round in `model`. Afterwards
 space_check and tree_check run on the new snapshot. With `written`, the pages the commit wrote are added
 to it; with `put_growth`, the pages its puts added at the end of the file
-(as opposed to the commit's free-list run). Returns the first error from
-put or commit, without failing the test, so that callers can expect
-Map_Full.
+(as opposed to the commit's free-list run). With `unique_keys`, no key is
+drawn twice in one commit: a key overwritten twice with overflow values
+frees the run it allocated first as a loose page, which the commit returns
+to the free list's ready part. Returns the first error from put or commit,
+without failing the test, so that callers can expect Map_Full.
 */
-steady_commit :: proc(t: ^testing.T, env: ^kv.Env, model: []int, round, count: int, written: ^[dynamic]kv.Pgno = nil, put_growth: ^int = nil, fixed_size := false, loc := #caller_location) -> kv.Error {
+steady_commit :: proc(t: ^testing.T, env: ^kv.Env, model: []int, round, count: int, written: ^[dynamic]kv.Pgno = nil, put_growth: ^int = nil, fixed_size := false, unique_keys := false, loc := #caller_location) -> kv.Error {
 	txn, err := kv.txn_begin(env, read_only = false)
 	if err != .None {
 		testing.expectf(t, false, "round %d: txn_begin: %v", round, err, loc = loc)
@@ -100,8 +102,15 @@ steady_commit :: proc(t: ^testing.T, env: ^kv.Env, model: []int, round, count: i
 	defer kv.txn_abort(&txn)
 	begin_last := txn.snapshot.last_pgno
 	keys := make([]int, count, context.temp_allocator)
+	if unique_keys && count < STEADY_KEYS {
+		copy(keys, rand.perm(STEADY_KEYS, context.temp_allocator)[:count])
+	}
 	for &i, j in keys {
-		i = j if count == STEADY_KEYS else rand.int_max(STEADY_KEYS)
+		if count == STEADY_KEYS {
+			i = j
+		} else if !unique_keys {
+			i = rand.int_max(STEADY_KEYS)
+		}
 		key: [8]byte
 		if err = kv.put(&txn, u64_key(&key, u64(i)), steady_value(i, round, env.page_size, fixed_size)); err != .None {
 			return err
@@ -188,14 +197,16 @@ test_env_stats :: proc(t: ^testing.T) {
 	testing.expect(t, s.last_pgno > 2 && s.file_pages > int(s.last_pgno), "no pages or no growth step")
 	testing.expect(t, s.free_ready == 0 && s.free_pending == 0, "the first commit freed pages")
 
-	// Three readers on two snapshots.
+	// Three readers on two snapshots. Distinct keys per commit, so that no
+	// commit frees a page it allocated itself (a loose page, which goes to
+	// `ready` at once): about 1% of seeds did (KV-T-0033).
 	r1, _ := kv.txn_begin(env)
 	r2, _ := kv.txn_begin(env)
-	testing.expect_value(t, steady_commit(t, env, model, 1, 20), kv.Error.None)
+	testing.expect_value(t, steady_commit(t, env, model, 1, 20, unique_keys = true), kv.Error.None)
 	r3, _ := kv.txn_begin(env)
 	expect_matches(t, env, 3, r1.snapshot.txn_id)
 	for round in 2 ..< 5 {
-		testing.expect_value(t, steady_commit(t, env, model, round, 20), kv.Error.None)
+		testing.expect_value(t, steady_commit(t, env, model, round, 20, unique_keys = true), kv.Error.None)
 	}
 	// The readers pin everything freed since, so nothing is reusable.
 	s = expect_matches(t, env, 3, r1.snapshot.txn_id)

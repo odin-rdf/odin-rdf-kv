@@ -158,3 +158,89 @@ Decomposed 2026-09-25, the owner moving the initiative through design and ready 
 6. **KV-T-0031** — the seeded fuzz mode (D4, D5).
 7. **KV-T-0032** — the real-kill test with a helper process (D1).
 8. **KV-T-0033** — measure the sweep, admit it to the suite and CI (D9), and document step 7.
+
+## Results (2026-09-25)
+
+All eight tasks (KV-T-0026 to KV-T-0033) are done; KV-T-0033 was completed after the coordinator's steady-state run. The ordinary suite has 164 tests and the hooked build (`KV_IO_HOOK` + `KV_NO_SYNC`) 183: the 19 more are the ten crash sweeps, five journal tests and four poison tests, registered only there. Both pass on macOS arm64 (debug, `-o:speed`, ASan; hooked debug and `-o:speed`) and on Linux arm64 and amd64 (debug, `-o:speed`, hooked debug, hooked `-o:speed`). The fuzz mode and the real-kill test ran in their tasks (KV-T-0031, KV-T-0032), on demand, and not again here. **Steady-state tests (`scripts/test.sh --steady`):** run by the coordinator after KV-T-0033, on macOS arm64 (2026-09-25): **all pass** — debug 168 (4 min 10 s), `-o:speed` 168 (3 min 29 s), ASan 168 (3 min 41 s), hooked debug 187 (22 s: with `KV_NO_SYNC` the steady tests run without `F_FULLFSYNC`), and every cross-target check; 11 min 52 s wall, 177% CPU on average. Not run in the Linux container. Each task's status section records its decisions, measurements and deliberate-bug checks. The initiative itself awaits the owner's review.
+
+### Exit criteria
+
+| Goal | Status | Evidence |
+|---|---|---|
+| A crash harness cutting at every I/O operation of a commit, including transactions that spilled, wrote overflow runs or streamed the free list first; reopen checked against the model, `tree_check`, `space_check`, and the next commit | ✓ | `tests/crash.odin` and `tests/crash_sweep_test.odin` (KV-T-0026, -0027). Kill images at every cut of workloads 1–4: puts 17 cuts, spill 99 (spilling, overflow values, a free-list run of more than one page, one cut right after the file grew), deletes 6 (a merge and a root collapse), reuse 50 over three commits (each writing into pages at or below its starting `last_pgno`); each workload asserts it did what it is named for. Every image opens at exactly the expected txn, passes `model_diff` (every key, both scan directions), `space_check`, one more commit and a reopen |
+| Both a process kill and a power loss simulated | ✓ | Power-loss images per window before each sync (KV-T-0028): none, all, only the meta page, the meta page torn, and 16 random subsets with 512-byte sector tears (a meta write torn to a byte prefix): 222 images over workloads 1–4 by default, 2,430 with `KV_CRASH_SUBSETS=200`. Each opens at the last synced commit or, only if the successor's meta page is whole in the image, the successor. Plus a meta-corruption image per cut (the newest meta page unreadable → S − 1, KV-I-0002 D1's horizon). Plus a real `SIGKILL` of a helper process with real syncs, on demand (KV-T-0032) |
+| The same across `env_open` of a new file (D6) | ✓, with an open exception | `env_open` recreates an all-zero two-page file (KV-T-0029). Every kill cut of creation opens as an empty database, at 4 KiB and 16 KiB pages. Of the 50 fixed power-loss creation images, 11 open and 39 stay `.Corrupted` under D6 as decided; the sweep pins them. **KV-T-0035**, an open owner decision |
+| The env refuses writes after a failed sync or meta-page write (D7), with a test that fails without it | ✓ | `Error.Poisoned`, `Stats.poisoned` (KV-T-0030); `tests/poison_test.odin` injects each of the three failures. Without the flag, the final-sync case reproduces D7's hazard: the next transaction rewrote all 14 pages the failed commit wrote, and the kill image before its meta page opened as `.Corrupted` |
+| A fuzzing mode over the model, by seed, reproducible (D4, D5) | ✓ | `-define:KV_FUZZ=true`, `test_fuzz_model` (KV-T-0031); options derived from the seed alone; a failure at seed 7, op 251,718 of a six-seed run reproduced alone at the same operation, at k = 10 and k = 1 |
+| Cheap by default, on CPU and CI minutes (D3, D8, D9) | ✓ | The default sweep costs 0.27 s at `-o:speed` and 0.9 s debug on one thread (below); `KV_NO_SYNC` halves the hooked suite's time; everything long is behind a define; the CI invocation is below |
+
+The vision's two criteria: **crash safety** (a kill at any phase of commit reopens at the last committed state) is met for every cut of five workloads, by construction of the kill images and by the real-kill test, and holds under the stronger power-loss model except for creation (KV-T-0035). **Correctness** (fuzzed sequences match the oracle, both scan directions) is met by the model and its fuzz mode; see the vision's Current State, amended 2026-09-25.
+
+**Deliberate-bug checks**, each failing a test (details in the tasks): skipping the hook in each of the three procedures, recording a wrong offset, ignoring the hook's error or `NO_SYNC`, a global hook (KV-T-0026); the meta page before the data pages, copy-on-write freeing a committed page as loose, `page_free` making committed pages loose (KV-T-0027); no meta checksum, the first sync dropped, the lower `txn_id` chosen, the meta page into a fixed slot, a reuse horizon of S (KV-T-0028); accepting any all-zero file, removing the rule, dropping the zero check, the wrong page size (KV-T-0029); the flag never set, ignored, set too early, or not set on the final sync (KV-T-0030); an overflow off-by-one caught by the fuzz mode at the three seeds the ordinary tests missed (KV-T-0031); the real-kill test does **not** see ordering bugs, by design, and does see a meta page synced before its data (KV-T-0032).
+
+### Measurements (KV-T-0033)
+
+The default sweep is every test registered only by `KV_IO_HOOK` in `crash_sweep_test.odin`: kill and power-loss images over workloads 1–5 and the meta-corruption images. Hooked build, `KV_NO_SYNC`, `-define:ODIN_TEST_THREADS=1`, time as the test runner reports it (building not included). macOS arm64 is an M4 Pro, with a load average of 3–5 from other work; Linux arm64 is the OrbStack container (`scripts/linux.Dockerfile`).
+
+| | macOS arm64 `-o:speed` | macOS arm64 debug | Linux arm64 `-o:speed` | Linux arm64 debug |
+|---|---|---|---|---|
+| default sweep (10 tests) | 0.27 s (268, 271 ms) | 0.85, 0.89 s | 0.35, 0.37 s | 0.96, 0.96 s |
+| the other hooked-only tests (5 journal, 4 poison) | 0.09 s | 0.24 s | 0.06 s | 0.23 s |
+| `KV_CRASH=true` sweep (10 tests) | 10.5 s | — | 15.9 s | — |
+
+Per workload in the default sweep at `-o:speed`, macOS: kill: create 5 + 5 cuts, 12 ms; deletes 6, 7 ms; puts 17, 18 ms; reuse 50, 28 ms; spill 99, 53 ms. Power loss: create 66 + 66 images, 19 ms; deletes 37 images + 2 meta-corruption, 14 ms; puts 37 + 2, 31 ms; reuse 111 + 4, 49 ms; spill 37 + 2, 39 ms. The rest of the 0.27 s is building each workload's trees. Under `KV_CRASH` on macOS the kill sweep is most of it: reuse 1,064 cuts 7.5 s, spill 605 cuts 0.70 s, deletes 74 cuts 0.43 s, puts 24 cuts 0.16 s; the power sweeps 0.2–0.9 s each (Linux: reuse kill 10.5 s, spill kill 2.4 s).
+
+**Nothing was shrunk or moved behind `KV_CRASH`:** the default sweep is 0.27 s at `-o:speed` and under 1 s in a debug build, against the criterion's 2 s.
+
+### CI (D9)
+
+**The default sweep is admitted to the ordinary suite as it stands**: it is registered by `KV_IO_HOOK`, which the CI invocation sets, so CI runs it with no further define. The ordinary unhooked builds don't register it (the hook is compiled out of them, by design), and `scripts/test.sh` and `scripts/test-linux.sh` already run a hooked build. The invocation, ready for the workflow's steps (one build per runner, D9; the Odin release pinned to `dev-2026-09` like `scripts/linux.Dockerfile`):
+
+```sh
+# Type checks for every supported target (compile, don't run)
+for target in darwin_arm64 darwin_amd64 linux_arm64 linux_amd64; do
+	odin check kv -no-entry-point -vet -strict-style -target:"$target"
+	odin check tests -no-entry-point -vet -strict-style -target:"$target"
+	odin check tests -no-entry-point -vet -strict-style -target:"$target" -define:KV_IO_HOOK=true -define:KV_NO_SYNC=true
+	odin check tests/killer -vet -strict-style -target:"$target"
+done
+# The suite, once, optimised, with the I/O hook (the crash sweeps) and no syncs
+odin test tests -vet -strict-style -o:speed -define:KV_IO_HOOK=true -define:KV_NO_SYNC=true
+```
+
+Measured: the 16 checks take 1.0 s on macOS arm64 and 1.5 s on Linux arm64. The test step is about 5 s of build and 2.8–2.9 s of run for 183 tests: 8.1 s wall on macOS arm64 with 3 test threads (a `macos-latest` runner has 3 cores), 8.6 s in the Linux arm64 container with 4 (`ubuntu-latest` has 4). So about 10 s per runner beyond setup, on hardware faster than a runner's. Nothing on demand runs in CI: not the debug or ASan builds, TSan, `--steady`, `KV_CRASH`, the fuzz mode, the real-kill test, the criterion or the benchmarks.
+
+**Found by timing the invocation, fixed here:** two tests of the ordinary suite failed in exactly this configuration, neither a store bug.
+- `test_reader_table_across_threads` failed **every time on Linux** with `KV_NO_SYNC`, debug or `-o:speed` ("only 54 read transactions across 300 commits", 47–237 in a dozen runs): without syncs its 300 commits end before the six reader threads are well under way. It had passed in `scripts/test-linux.sh`'s hooked debug run only because the rest of the suite loaded the CPU. The writer now commits until the readers have begun more than 300 read transactions (a shared atomic count), up to 30,000 commits; on Linux that is 370–1,140 commits, on macOS still 300. Checked under TSan on macOS, with and without the hook.
+- `test_env_stats` failed at about 1% of seeds, in every build (3 of 300 random seeds; seed 6136440337835298 reproduces it in a plain debug build): a round of 20 random keys can draw a key twice, and a key overwritten twice with overflow values frees the run it allocated first as a loose page, which the commit puts straight into the free list's `ready` part, so "freed pages pending, none ready" did not hold. `steady_commit` gained `unique_keys` (no key drawn twice in a commit) and the test uses it; the three seeds pass, and 500 random seeds after the fix all pass. The other steady tests keep their random draws.
+
+`scripts/test-linux.sh` now runs the hooked build at `-o:speed` too, so the CI invocation runs natively on Linux locally before a push; it was the configuration that showed the first failure.
+
+### Deviations from the design
+
+- **KV-T-0026:** `IO_HOOK` and `NO_SYNC` live in `os_posix.odin`, beside the procedures they change, not beside `CHUNK_ACCOUNTING`. `journal_image_kill`'s `n` is a count. `NO_SYNC` turned out assertable after all (`os_sync(-1)`).
+- **KV-T-0027:** three of the four deliberate bugs its criterion named are invisible to a kill image by construction (a missing sync, the meta slot written, the reuse horizon); kill-visible equivalents were checked, and the three moved to KV-T-0028. The cut after `file_grow`'s truncate needed a baseline built with a small map, since the file grows by at least 1 MiB.
+- **KV-T-0028:** power-loss images per **window** before each sync, not per cut (an intermediate cut can only produce a subset of the images of the window it is in), and 16 random subsets by default, not 4. A **meta-corruption** image was added, beyond the power-loss model, because it is the only way to show the S − 1 horizon.
+- **KV-T-0029:** power-loss creation images that D6 refuses are pinned as `.Corrupted` and counted, not made to open (KV-T-0035). The sweep also runs at 16 KiB pages.
+- **KV-T-0030:** the reopen after a failure is asserted exactly per point (the hook fails an operation whole), rather than "either state".
+- **KV-T-0031:** a seed's pool and key count come from the seed alone; `KV_FUZZ_CHECK_EVERY` counts transaction ends, not commits. The oracle is the existing model (a version and size per key, values regenerated), not a `map[string]string`.
+- **KV-T-0032:** on Linux it runs through a direct `docker run`, since `scripts/test-linux.sh`'s hooked runs set `KV_NO_SYNC`, which the test refuses.
+- **KV-T-0033:** `KV_CRASH` selects larger trees only; the design said "larger trees and more random subsets", and the subsets are `KV_CRASH_SUBSETS` on its own. Two timing- and seed-dependent tests fixed (above), and a fourth configuration in `scripts/test-linux.sh`.
+
+### Known limitations
+
+- **A power loss during creation can leave a file that never opens** (KV-T-0035, **an open decision for the owner**): the truncate lost under a kept meta write, or a meta write torn with no whole one beside it. It holds no data, since nothing was committed. Recommended there: a sync after the truncate now, and the sector-atomicity question separately.
+- **The simulation assumes the sync contract** (a sync that returned made everything before it durable) and tests none of the physical durability of `F_FULLFSYNC` or `fdatasync`. Directory entries (a new file's name) are not modelled.
+- **Fault injection fails an operation whole**: a partial meta write followed by a poisoned env isn't simulated (KV-T-0028's torn images cover what the file then holds). After a failed `fsync` the kernel may drop pages; no image models that, and poisoning is the answer to it.
+- **The real-kill test is a smoke test**, not an ordering detector: it can't see a missing or misplaced sync, and a kill almost never lands in a window of a few `pwrite`s.
+- **Only the newest meta page's loss is recovered**; data pages carry no checksum (a non-goal).
+- **The journal is per thread**: it sees a store's I/O because every write happens on the thread holding the write transaction. A future background writer would escape it.
+- **Coverage gaps filed as tech debt:** the reuse-horizon bug is caught by one workload only (KV-T-0034); an overflow size boundary is caught reliably only by the fuzz mode, not the default suite (KV-T-0036); fuzz seeds with 100 keys never spill and no seed passes depth 4 (KV-T-0037).
+- **No CI workflow yet**: the owner adds it (D9); the invocation above is what it needs.
+
+### Backlog filed
+
+- KV-T-0034 (tech debt): let the spill crash sweep reach the reuse-horizon bug.
+- KV-T-0035 (bug, **owner decision**): a power loss during creation can leave a file that never opens.
+- KV-T-0036 (tech debt): a directed test for overflow value size boundaries.
+- KV-T-0037 (tech debt): make fuzz seeds reach spills and depth 5.

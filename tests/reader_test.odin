@@ -259,6 +259,9 @@ test_reader_table_allocates_nothing :: proc(t: ^testing.T) {
 Table_Reader :: struct {
 	env:     ^kv.Env,
 	stop:    ^bool,
+	// Read transactions begun by every reader, read by the writer while
+	// they run.
+	total:   ^int,
 	// Results, read after the thread is joined.
 	begins:  int,
 	problem: string,
@@ -277,6 +280,7 @@ table_reader_run :: proc(r: ^Table_Reader) {
 			return
 		}
 		r.begins += 1
+		sync.atomic_add(r.total, 1)
 		b: kv.Txn
 		two := rand.int_max(2) == 0
 		if two {
@@ -287,6 +291,7 @@ table_reader_run :: proc(r: ^Table_Reader) {
 				return
 			}
 			r.begins += 1
+			sync.atomic_add(r.total, 1)
 			if b.snapshot.txn_id < a.snapshot.txn_id {
 				r.problem = "a later reader got an older snapshot"
 			}
@@ -313,6 +318,11 @@ table_reader_run :: proc(r: ^Table_Reader) {
 
 // Readers begin and end on several threads while a writer commits. The table
 // stays valid throughout and ends empty. Run with -sanitize:thread.
+//
+// The writer makes COMMITS commits, and goes on until the readers have begun
+// more read transactions than that, up to MAX_COMMITS: without syncs
+// (KV_NO_SYNC) 300 commits can end before the reader threads are well under
+// way, which on Linux left 50–250 read transactions every time (KV-T-0033).
 @(test)
 test_reader_table_across_threads :: proc(t: ^testing.T) {
 	dir := temp_dir_create(t)
@@ -327,19 +337,25 @@ test_reader_table_across_threads :: proc(t: ^testing.T) {
 
 	READERS :: 6
 	stop := false
+	total := 0
 	readers: [READERS]Table_Reader
 	threads: [READERS]^thread.Thread
 	for &r, i in readers {
 		r = Table_Reader {
 			env  = env,
 			stop = &stop,
+			total = &total,
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&r, table_reader_run)
 	}
 
 	COMMITS :: 300
+	MAX_COMMITS :: 100 * COMMITS
 	max_readers := 0
-	for i in 0 ..< COMMITS {
+	commits := 0
+	for commits < COMMITS || (commits < MAX_COMMITS && sync.atomic_load(&total) <= COMMITS) {
+		i := commits
+		commits += 1
 		commit_one(t, env, i)
 		n, problem := reader_table_check(env)
 		testing.expectf(t, problem == "", "after commit %d: %s", i, problem)
@@ -356,12 +372,13 @@ test_reader_table_across_threads :: proc(t: ^testing.T) {
 		testing.expectf(t, r.problem == "", "reader %d: %s", i, r.problem)
 		testing.expectf(t, r.begins > 0, "reader %d never began", i)
 	}
-	total := 0
+	begins := 0
 	for r in readers {
-		total += r.begins
+		begins += r.begins
 	}
-	log.infof("%d read transactions across %d commits, at most %d live at a commit", total, COMMITS, max_readers)
-	testing.expectf(t, total > COMMITS, "only %d read transactions across %d commits", total, COMMITS)
+	testing.expect_value(t, begins, total)
+	log.infof("%d read transactions across %d commits, at most %d live at a commit", begins, commits, max_readers)
+	testing.expectf(t, begins > COMMITS, "only %d read transactions across %d commits", begins, commits)
 
 	n, problem := reader_table_check(env)
 	testing.expectf(t, problem == "", "at the end: %s", problem)
