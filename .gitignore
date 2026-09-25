@@ -2,3 +2,7 @@
 liblmdb/
 
 .DS_Store
+
+# Test and build output
+*.dSYM/
+*.bin
