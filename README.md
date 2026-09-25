@@ -29,10 +29,10 @@ odin build . -collection:kv=../odin-rdf-kv
 ```
 
 ```odin
-import kv "kv:kv"
+import "kv:kv"
 ```
 
-If you use the Odin language server, mirror the collection in your `ols.json`. A relative import (`import kv "../odin-rdf-kv/kv"`) works too.
+If you use the Odin language server, mirror the collection in your `ols.json`. A relative import (`import "../odin-rdf-kv/kv"`) works too.
 
 ## Quick start
 
@@ -42,7 +42,7 @@ package example
 import "core:bytes"
 import "core:fmt"
 
-import kv "kv:kv"
+import "kv:kv"
 
 readme_example :: proc(path: string) -> kv.Error {
 	env := kv.env_open(path, kv.Options{mapped_budget = 16 << 20}) or_return
