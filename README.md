@@ -15,7 +15,7 @@ What sets it apart is that **the store limits its own memory**. It is built to r
 
 All seven steps of the original design are built and tested: the file format, reads and writes, cursors, delete with merge, page reuse, the memory budget, and crash tests with fuzzing. The suite has 165 tests (184 in the build with the crash sweeps) and passes on macOS arm64 and on Linux arm64 and amd64.
 
-- **No release is tagged yet**, and there is no CI workflow yet.
+- **No release is tagged yet.** CI runs the suite on Linux (`ubuntu-latest`) on every push to `main` and every pull request; macOS is tested locally.
 - **The file format is version 1**, and there is no migration path to any later version.
 - **Platforms:** macOS (development) and Linux (production), 64-bit only. There is no Windows support.
 - **Toolchain:** Odin `dev-2026-09`.

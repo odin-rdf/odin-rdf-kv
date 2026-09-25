@@ -1,0 +1,84 @@
+# The shape follows odin-rdf-record's workflow; the steps are the invocation
+# KV-I-0005 D9 settled, written out in that initiative's Results
+# (.metis/archived/initiatives/KV-I-0005/initiative.md, "CI (D9)").
+#
+# This store has no sibling checkout, no python and no Makefile: the steps
+# call `odin` directly, as scripts/test.sh does.
+name: CI
+
+# Documentation-only commits do not run this workflow. A denylist, not an
+# allowlist: an allowlist fails toward no CI when a source directory is added
+# and not named; a denylist fails toward a pointless run.
+#
+# README.md is ignored although its quick start is compiled: the compiled
+# copy is tests/readme_test.odin, which a README-only commit doesn't touch.
+# `.github/**` is absent from the list: a change to CI must run CI.
+# `workflow_dispatch` carries no filter, so any commit can be run by hand.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.metis/**'
+      - 'README.md'
+      - 'CLAUDE.md'
+      - 'LICENSE'
+  pull_request:
+    paths-ignore:
+      - '.metis/**'
+      - 'README.md'
+      - 'CLAUDE.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # **Linux only, by the owner's decision (2026-09-25).** A macOS runner
+    # bills at ten times a Linux one, and the GitHub organization is keeping
+    # runner minutes down across its repositories. Linux is also where this
+    # store runs in production. macOS, the development platform, is covered
+    # locally by scripts/test.sh on every task, in more configurations than CI
+    # runs (debug, -o:speed, ASan, the hooked build), so a macOS-only
+    # regression is caught before a push rather than after it. The macOS code
+    # paths (F_FULLFSYNC, the MAP_FIXED remaps) are still type-checked here by
+    # the darwin targets below.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Pinned to the release scripts/linux.Dockerfile builds with and the
+      # development machine runs, so CI, the Linux container and a local run
+      # compile with the same compiler. Bump all three together.
+      - uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: dev-2026-09
+
+      - name: Odin version
+        run: odin version
+
+      # Compile, don't run: every supported target, the hooked test build,
+      # and the real-kill test's helper, which only that on-demand test builds.
+      - name: Type-check every target
+        run: |
+          for target in darwin_arm64 darwin_amd64 linux_arm64 linux_amd64; do
+            echo "== odin check -target:$target"
+            odin check kv -no-entry-point -vet -strict-style -target:"$target"
+            odin check tests -no-entry-point -vet -strict-style -target:"$target"
+            odin check tests -no-entry-point -vet -strict-style -target:"$target" -define:KV_IO_HOOK=true -define:KV_NO_SYNC=true
+            odin check tests/killer -vet -strict-style -target:"$target"
+          done
+
+      # The suite once, optimised, with the I/O hook (which registers the
+      # crash sweeps) and without syncs (KV-I-0005 D3: no test can observe a
+      # sync but by its cost and its error, and the error is injected
+      # through the hook). About 10 s. Nothing on demand runs here: not the
+      # debug or ASan builds, TSan, the steady-state tests, KV_CRASH, the
+      # fuzz mode, the real-kill test, the criterion or the benchmarks.
+      # scripts/test-linux.sh runs this same configuration locally.
+      - name: Test
+        run: odin test tests -vet -strict-style -o:speed -define:KV_IO_HOOK=true -define:KV_NO_SYNC=true

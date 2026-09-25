@@ -77,6 +77,7 @@ The owner took the recommendations on every point. The open questions below are 
   - **One build per runner, `-o:speed`**, plus the cross-target `odin check`s, which compile but don't run and cost little. The debug and ASan builds, TSan, `--steady`, the fuzz mode, the real-kill test, the criterion and the benchmarks stay local.
   - **The small crash sweep is in the ordinary suite, so CI runs it**, once measured at about a second (see the design). The large sweep (`KV_CRASH`) does not run in CI.
   - The Odin release: the record uses `release: latest`; this repository pins `dev-2026-09` in `scripts/linux.Dockerfile`, and the workflow should pin the same, so CI and the container agree.
+  - *(Amended 2026-09-25, after the initiative was archived: **the workflow is added, `.github/workflows/ci.yml`, and it runs on `ubuntu-latest` only.** The owner dropped the macOS runner because it bills at ten times a Linux one; macOS stays covered locally by `scripts/test.sh`, and its code paths are still type-checked by the darwin targets. The Odin release is pinned to `dev-2026-09` as above. The bullets above stand as the record of what was first proposed.)*
 
 ## Open questions for the owner
 
