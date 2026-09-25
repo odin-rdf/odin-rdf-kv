@@ -4,14 +4,14 @@ level: initiative
 title: "Crash tests and fuzzing"
 short_code: "KV-I-0005"
 created_at: 2026-09-24T22:50:49.319079+00:00
-updated_at: 2026-09-24T22:50:49.319079+00:00
+updated_at: 2026-09-25T09:13:46.801307+00:00
 parent: KV-V-0001
 blocked_by: []
 archived: false
 
 tags:
   - "#initiative"
-  - "#phase/discovery"
+  - "#phase/decompose"
 
 
 exit_criteria_met: false
@@ -148,4 +148,13 @@ The default sweep runs these at a size that is measured to take about a second i
 
 ## Implementation Plan
 
-*Not started. Tasks are created at decompose time, after the owner has reviewed the design, one commit per task, as in KV-I-0001 to KV-I-0004. The likely order: the hook, `KV_NO_SYNC` and the journal helper; the kill sweep over workloads 1–5; the power-loss images; D6; D7 with its deliberate-bug test; the fuzz mode; the real-kill test; the measurements for D9's admission of the sweep into the ordinary suite.*
+Decomposed 2026-09-25, the owner moving the initiative through design and ready to decompose. One commit per task, in this order:
+
+1. **KV-T-0026** — the I/O hook, `KV_NO_SYNC` and the journal (D1, D3).
+2. **KV-T-0027** — the kill-image sweep over workloads 1–4 (D1, D8).
+3. **KV-T-0028** — power-loss images: lost, torn and reordered writes (D2).
+4. **KV-T-0029** — recreate a new file with nothing written, and sweep creation (D6, workload 5).
+5. **KV-T-0030** — poison the env after a failed sync or meta-page write (D7).
+6. **KV-T-0031** — the seeded fuzz mode (D4, D5).
+7. **KV-T-0032** — the real-kill test with a helper process (D1).
+8. **KV-T-0033** — measure the sweep, admit it to the suite and CI (D9), and document step 7.
