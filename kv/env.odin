@@ -186,8 +186,10 @@ would use (Options.page_size, or DEFAULT_PAGE_SIZE), every byte of it
 zero, is what a crash during creation leaves after the file was sized and
 before either meta page reached it, and is initialised as a new database.
 Nothing else is: a damaged database is never replaced by an empty one.
-Creation that tore a meta page, or lost the sizing but not a meta write,
-leaves a file that stays Corrupted (see KV-T-0029).
+Creation makes the sizing durable before writing a meta page, so the one
+image of creation that stays Corrupted is a power loss that tore a meta
+write with neither meta page whole. Whether that can happen depends on
+whether a sector write can tear, which is still open (KV-T-0038).
 */
 env_open :: proc(path: string, options := Options{}, allocator := context.allocator) -> (env: ^Env, err: Error) {
 	page_size := options.page_size if options.page_size != 0 else DEFAULT_PAGE_SIZE
@@ -459,6 +461,12 @@ meta_write_fd :: proc(fd: posix.FD, page_size: int, slot: int, meta: Meta) -> Er
 @(private = "file")
 init_meta_pages :: proc(fd: posix.FD, page_size: int) -> Error {
 	os_truncate(fd, 2 * i64(page_size)) or_return
+	// The sizing is durable before a meta page is written, so a power loss
+	// can't keep a meta write while losing the sizing: that leaves a file
+	// shorter than the page its meta page describes, which no rule opens.
+	// A loss before this sync leaves no file, an empty one, or two zero
+	// pages, all opened as new (D6, KV-T-0035).
+	os_sync(fd) or_return
 	meta := Meta {
 		magic     = MAGIC,
 		version   = VERSION,

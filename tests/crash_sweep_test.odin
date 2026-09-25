@@ -67,12 +67,15 @@ when kv.IO_HOOK {
 
 	// Workload 5 (KV-I-0005 D6, KV-T-0029): creation, at the default page
 	// size and at 16 KiB. A kill image is no file, two zero pages, or one
-	// or both meta pages whole: each opens as an empty database.
+	// or both meta pages whole: each opens as an empty database. Six cuts:
+	// the baseline and one after each of the five operations, the sync
+	// after the truncate (KV-T-0035) included.
 	@(test)
 	test_crash_kill_create :: proc(t: ^testing.T) {
 		for w in ([]Crash_Workload{crash_workload_create, crash_workload_create_16k}) {
 			s, ok := crash_kill(t, w)
 			testing.expectf(t, !ok || s.after_truncate == 1, "%d cuts after a truncate, want the one of creation", s.after_truncate)
+			testing.expectf(t, !ok || s.cuts == 6, "%d cuts, want 6", s.cuts)
 		}
 	}
 
@@ -82,10 +85,15 @@ when kv.IO_HOOK {
 			run: Crash_Run
 			start := time.tick_now()
 			s, ok := crash_sweep(t, w, &run, crash_sweep_create_power)
-			log.infof("%s: power loss during creation: %d images, %d refused as Corrupted (%d a torn meta page on two pages, %d with the truncate lost), in %v",
-				run.name, s.images, s.refused_torn + s.refused_short, s.refused_torn, s.refused_short, time.tick_since(start))
-			// Both kinds of refusal occur, and are what the task reports.
-			testing.expectf(t, !ok || (s.refused_torn > 0 && s.refused_short > 0), "%s: no refused image of some kind", run.name)
+			log.infof("%s: power loss during creation: %d images over %d windows, %d refused as Corrupted (%d a torn meta page on two pages, %d with the truncate lost), in %v",
+				run.name, s.images, s.windows, s.refused_torn + s.refused_short, s.refused_torn, s.refused_short, time.tick_since(start))
+			// The sync after the truncate (KV-T-0035): a power loss never
+			// keeps a meta write while losing the sizing, so the only images
+			// refused are a meta write torn with neither whole, which the
+			// sector-atomicity question decides (KV-T-0038) and the sweep
+			// still pins.
+			testing.expectf(t, !ok || s.refused_short == 0, "%s: %d images with a meta write kept and the truncate lost", run.name, s.refused_short)
+			testing.expectf(t, !ok || s.refused_torn > 0, "%s: no image with a torn meta write refused", run.name)
 			crash_run_destroy(&run)
 		}
 	}
@@ -419,7 +427,7 @@ crash_workload_reuse :: proc(t: ^testing.T, path: string, run: ^Crash_Run) -> bo
 /*
 Workload 5: env_open of a path with no file (KV-I-0005 D6). The baseline
 is no file, the state the empty database at txn 0, and the journal
-env_open's truncate, two meta writes and sync. The images are opened at
+env_open's truncate, sync, two meta writes and sync. The images are opened at
 the page size the database was created at (Crash_Run.options), since the
 D6 rule is at the page size of the open.
 */
@@ -452,5 +460,9 @@ crash_create :: proc(t: ^testing.T, path: string, run: ^Crash_Run, name: string,
 		return false
 	}
 	crash_finish(run, env)
-	return testing.expectf(t, len(run.journal.ops) == 4, "%s: creation made %d operations, want 4", name, len(run.journal.ops))
+	// The journal's shape is the sweeps' to check: the kill sweep counts
+	// its cuts (the sync after the truncate, KV-T-0035, is one of them),
+	// and the power sweep takes its windows from the syncs, so creation
+	// without that sync still reaches it and shows what it costs.
+	return true
 }

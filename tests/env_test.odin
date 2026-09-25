@@ -319,6 +319,7 @@ test_env_new_file_rule_is_narrow :: proc(t: ^testing.T) {
 	// What a power loss during creation can leave with a meta write torn
 	// (KV-T-0029): slot 0 holding a prefix of its meta page, slot 1 zero.
 	// No valid meta page, not all zero: refused, like any other damage.
+	// Whether it should open is the owner's open question (KV-T-0038).
 	fresh := strings.clone(temp_dir_file(dir, "fresh"), context.temp_allocator)
 	defer file_remove(fresh)
 	env, err := kv.env_open(fresh)

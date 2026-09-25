@@ -415,8 +415,9 @@ io_hook_per_thread :: proc(t: ^testing.T) {
 	for h, i in hs {
 		testing.expectf(t, h.err == .None, "thread %d: %v", i, h.err)
 		testing.expectf(t, h.other_fd == 0, "thread %d: %d operations on another fd", i, h.other_fd)
-		// env_open's sync, then two per commit.
-		testing.expectf(t, h.syncs == 1 + 2 * h.commits, "thread %d: %d syncs for %d commits", i, h.syncs, h.commits)
+		// env_open's two syncs (after the truncate, KV-T-0035, and after
+		// the meta pages), then two per commit.
+		testing.expectf(t, h.syncs == 2 + 2 * h.commits, "thread %d: %d syncs for %d commits", i, h.syncs, h.commits)
 		testing.expectf(t, h.image_ok, "thread %d: the kill image differs from the file", i)
 	}
 	testing.expect(t, hs[0].fd != hs[1].fd, "the two envs share a file descriptor")

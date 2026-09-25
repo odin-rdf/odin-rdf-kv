@@ -536,7 +536,8 @@ Crash_Sweep :: struct {
 	corrupt:        int,
 	// A creation sweep's power-loss images that open as no database
 	// (Corrupted, see crash_sweep_create_power): a meta write torn with
-	// nothing whole beside it, or a meta write kept with the sizing lost.
+	// nothing whole beside it, or a meta write kept with the sizing lost
+	// (none since the sync after creation's truncate, KV-T-0035).
 	refused_torn:   int,
 	refused_short:  int,
 }
@@ -893,82 +894,110 @@ crash_image_meta_corrupt :: proc(t: ^testing.T, run: ^Crash_Run, path: string, n
 }
 
 /*
-Power losses during creation (KV-I-0005 D6, workload 5, KV-T-0029).
+Power losses during creation (KV-I-0005 D6, workload 5, KV-T-0029,
+KV-T-0035).
 
-env_open of a new file is one window with no sync before it: truncate to
-two pages, the meta page of slot 0, the meta page of slot 1, sync. There
-is no committed state before it, so the power-loss sweep of commits
-(which expects the synced commit or its successor) doesn't fit; this one
-takes every combination of the truncate taken or not and each meta write
-lost, whole, or torn to a prefix of 1, POWER_META_TORN or all but one of
-its bytes (50 images), then CRASH_SUBSETS random ones. Each image is
-classified by what it is, and must open accordingly:
+env_open of a new file is truncate to two pages, sync, the meta page of
+slot 0, the meta page of slot 1, sync. There is no committed state before
+it, so the power-loss sweep of commits (which expects the synced commit or
+its successor) doesn't fit; this one cuts the same way, before each sync,
+and takes every combination of the window's operations: a truncate taken
+or not, each meta write lost, whole, or torn to a prefix of 1,
+POWER_META_TORN or all but one of its bytes (2 images for the truncate's
+window, 25 for the meta writes'), then CRASH_SUBSETS random ones per
+window. The windows come from the journal, so creation without the sync
+after its truncate is one window of all three operations (50 images).
+Each image is classified by what it is, and must open accordingly:
 
 - no file, or two pages all zero (D6): as an empty database, and pass
   crash_image_check at txn 0;
 - two pages with a meta write whole in it: the same;
-- anything else, which is a meta write torn with no whole one beside it,
-  or a meta write kept while the truncate was lost (a file shorter than
-  two pages, or one page and a meta prefix): Corrupted. Such a file has
-  no valid meta page and isn't all zero, so D6 refuses it by design. This
-  pins what the store does today; whether a torn creation should open is
-  the owner's question (KV-T-0029's status update). They are counted in
-  refused_torn (two pages long) and refused_short.
+- anything else: Corrupted. Such a file has no valid meta page and isn't
+  all zero, so D6 refuses it by design. Counted in refused_torn when it is
+  two pages long (a meta write torn with no whole one beside it), and in
+  refused_short otherwise (a meta write kept while the sizing was lost).
+  The sync after the truncate makes refused_short impossible, which the
+  test asserts; refused_torn remains, and whether a sector write can tear
+  is the owner's open question (KV-T-0038).
 
-The run must hold the creation's journal and nothing else, with states[0]
-the empty database at txn 0.
+The run must hold the creation's journal and nothing else (truncates, meta
+writes of txn 0 and syncs, ending in a sync), with states[0] the empty
+database at txn 0.
 */
 crash_sweep_create_power :: proc(t: ^testing.T, run: ^Crash_Run, path: string) -> (s: Crash_Sweep, ok: bool) {
 	ops := run.journal.ops[:]
-	shape := len(ops) == 4 && ops[0].kind == .Truncate && ops[3].kind == .Sync
-	for i in 1 ..= 2 {
-		if shape {
-			id, is_meta := record_meta_txn_id(ops[i])
-			shape = is_meta && id == 0
-		}
+	shape := len(ops) > 0 && ops[len(ops) - 1].kind == .Sync
+	for r in ops {
+		id, is_meta := record_meta_txn_id(r)
+		shape &&= r.kind == .Truncate || r.kind == .Sync || (is_meta && id == 0)
 	}
-	if !testing.expectf(t, shape, "%s: creation is not truncate, two meta writes, sync: %v", run.name, ops) {
+	if !testing.expectf(t, shape, "%s: creation is not truncates, meta writes of txn 0 and syncs, ending in a sync: %v", run.name, ops) {
 		return s, false
 	}
-	n := len(ops) - 1
-	s.cuts = 1
-	s.windows = 1
-	meta_len := len(ops[1].bytes)
-	// Per meta write: lost (-1), whole (0), or torn to a prefix of that many bytes.
-	fates := []int{-1, 0, 1, POWER_META_TORN, meta_len - 1}
-	for truncate in ([]bool{false, true}) {
-		for f1 in fates {
-			for f2 in fates {
-				runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-				subset := make([dynamic]int, context.temp_allocator)
-				tears := make([dynamic]Io_Tear, context.temp_allocator)
-				if truncate {
-					append(&subset, 0)
-				}
-				for f, k in ([]int{f1, f2}) {
-					if f >= 0 {
-						append(&subset, 1 + k)
-					}
-					if f > 0 {
-						keep := make([][2]int, 1, context.temp_allocator)
-						keep[0] = {0, f}
-						append(&tears, Io_Tear{1 + k, keep})
-					}
-				}
-				if !crash_create_image(t, run, path, n, subset[:], tears[:], "fixed", &s) {
-					return s, false
-				}
+	for n in 0 ..< len(ops) {
+		if ops[n].kind != .Sync {
+			continue
+		}
+		first := journal_synced(run.journal, n)
+		if first == n {
+			continue
+		}
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		s.cuts += 1
+		s.windows += 1
+		all := make([]int, n - first, context.temp_allocator)
+		// Per operation of the window: its fates, and the one each image takes.
+		fates := make([][]int, n - first, context.temp_allocator)
+		pick := make([]int, n - first, context.temp_allocator)
+		for &i, k in all {
+			i = first + k
+			if ops[i].kind == .Truncate {
+				// Not taken (-1), or taken (0).
+				fates[k] = {-1, 0}
+			} else {
+				// Lost (-1), whole (0), or torn to a prefix of that many bytes.
+				fates[k] = {-1, 0, 1, POWER_META_TORN, len(ops[i].bytes) - 1}
 			}
 		}
-	}
-	all := []int{0, 1, 2}
-	for k in 0 ..< CRASH_SUBSETS {
-		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-		state := rand.create(t.seed ~ u64(k) << 32)
-		gen := rand.default_random_generator(&state)
-		subset, tears := power_random(ops, all, gen)
-		if !crash_create_image(t, run, path, n, subset, tears, fmt.tprintf("random subset %d", k), &s) {
-			return s, false
+		// Every combination, counting through pick like an odometer.
+		for {
+			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+			subset := make([dynamic]int, context.temp_allocator)
+			tears := make([dynamic]Io_Tear, context.temp_allocator)
+			for p, k in pick {
+				f := fates[k][p]
+				if f >= 0 {
+					append(&subset, all[k])
+				}
+				if f > 0 {
+					keep := make([][2]int, 1, context.temp_allocator)
+					keep[0] = {0, f}
+					append(&tears, Io_Tear{all[k], keep})
+				}
+			}
+			if !crash_create_image(t, run, path, n, subset[:], tears[:], "fixed", &s) {
+				return s, false
+			}
+			k := 0
+			for ; k < len(pick); k += 1 {
+				pick[k] += 1
+				if pick[k] < len(fates[k]) {
+					break
+				}
+				pick[k] = 0
+			}
+			if k == len(pick) {
+				break
+			}
+		}
+		for k in 0 ..< CRASH_SUBSETS {
+			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+			state := rand.create(t.seed ~ u64(n) << 20 ~ u64(k) << 32)
+			gen := rand.default_random_generator(&state)
+			subset, tears := power_random(ops, all, gen)
+			if !crash_create_image(t, run, path, n, subset, tears, fmt.tprintf("random subset %d", k), &s) {
+				return s, false
+			}
 		}
 	}
 	return s, true
@@ -983,11 +1012,15 @@ crash_create_image :: proc(t: ^testing.T, run: ^Crash_Run, path: string, n: int,
 		return false
 	}
 	s.images += 1
-	what := fmt.tprintf("power loss [seed %d] during creation, %s: subset %s, tears %s: %d bytes",
-		t.seed, name, power_ranges(subset), power_tears(tears), len(img))
+	what := fmt.tprintf("power loss [seed %d] during creation at cut %d of %d, %s: subset %s, tears %s: %d bytes",
+		t.seed, n, len(run.journal.ops), name, power_ranges(subset), power_tears(tears), len(img))
 	two_pages := len(img) == 2 * run.page_size
 	opens := len(img) == 0 || (two_pages && mem.check_zero(img[:]))
-	opens |= two_pages && (image_has(img[:], run.journal.ops[1]) || image_has(img[:], run.journal.ops[2]))
+	for r in run.journal.ops {
+		if _, is_meta := record_meta_txn_id(r); is_meta {
+			opens ||= two_pages && image_has(img[:], r)
+		}
+	}
 	if opens {
 		return crash_image_check(t, run, path, {0}, what)
 	}
