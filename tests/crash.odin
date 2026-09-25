@@ -3,6 +3,7 @@ package kv_tests
 import "base:runtime"
 import "core:c"
 import "core:fmt"
+import "core:math/rand"
 import "core:mem"
 import "core:slice"
 import "core:strings"
@@ -252,9 +253,9 @@ crash_image_check against the states it is allowed to open at:
 - a process kill after the first n operations (crash_sweep_kill): exactly
   crash_kill_txn(run, n), the commit whose meta-page write is the last one
   among them, or the baseline if there is none;
-- a power loss (KV-T-0028): crash_synced_txn(run, n), the last commit whose
-  meta page was followed by a sync, or its successor if that successor's
-  meta-page write is in the image whole.
+- a power loss (crash_sweep_power): crash_synced_txn(run, n), the last
+  commit whose meta page was followed by a sync, or its successor if and
+  only if that successor's meta-page write is in the image whole.
 
 Every workload commit is on the thread and the env the journal records,
 and the model is the store's contents key by key (see model.odin), so the
@@ -275,6 +276,9 @@ Crash_Run :: struct {
 	journal:   Journal,
 	// The txn_id of the baseline's snapshot.
 	base_txn:  kv.Txn_Id,
+	// The committed state of base_txn − 1, if the workload recorded it
+	// (crash_pre_baseline), for the meta-corruption images.
+	pre:       Model,
 	// states[i] is the committed state of txn base_txn + i: states[0] the
 	// baseline's, then one per workload commit.
 	states:    [dynamic]Model,
@@ -316,6 +320,7 @@ crash_run_destroy :: proc(run: ^Crash_Run) {
 	delete(run.states)
 	delete(run.commits)
 	delete(run.model)
+	delete(run.pre)
 	delete(run.value_buf)
 	run^ = {}
 }
@@ -386,8 +391,18 @@ crash_finish :: proc(run: ^Crash_Run, env: ^kv.Env) {
 	run.value_buf = make([]byte, max(run.max_value, 1))
 }
 
+// Records the model as the state of base_txn − 1: call it before the
+// changes of the last commit before crash_baseline.
+crash_pre_baseline :: proc(run: ^Crash_Run) {
+	delete(run.pre)
+	run.pre = slice.clone(run.model)
+}
+
 // The committed state of `txn_id`, if the run has it.
 crash_state :: proc(run: ^Crash_Run, txn_id: kv.Txn_Id) -> (m: Model, ok: bool) {
+	if run.pre != nil && txn_id + 1 == run.base_txn {
+		return run.pre, true
+	}
 	if txn_id < run.base_txn || int(txn_id - run.base_txn) >= len(run.states) {
 		return nil, false
 	}
@@ -506,8 +521,14 @@ Crash_Sweep :: struct {
 	cuts:           int,
 	// Cuts right after a truncate (file growth).
 	after_truncate: int,
-	// Cuts that open at one of the workload's commits, not the baseline.
+	// Cuts that open at one of the workload's commits, not the baseline
+	// (for a power-loss sweep: images).
 	committed:      int,
+	// A power-loss sweep's cuts with unsynced operations, its power-loss
+	// images, and its meta-corruption images.
+	windows:        int,
+	images:         int,
+	corrupt:        int,
 }
 
 /*
@@ -541,4 +562,322 @@ crash_sweep_kill :: proc(t: ^testing.T, run: ^Crash_Run, path: string) -> (s: Cr
 		s.committed += int(want != run.base_txn)
 	}
 	return s, true
+}
+
+/*
+Power-loss images (KV-I-0005 D2, KV-T-0028).
+
+A power loss keeps everything up to the last sync that returned, and of the
+operations after it any subset: each write lost, whole, or torn to some of
+its 512-byte sectors, and a truncate taken effect or not. Reordering needs
+no model of its own: the writes in a subset land at their own offsets, so
+the order they reached the disk in changes nothing unless two overlap, and
+of two overlapping writes the later one is the newer bytes, so they are
+applied in journal order.
+
+A meta-page write (header and meta, 96 bytes) is shorter than a sector, so
+no sector tear splits it. Io_Tear can still keep a prefix of it: a stricter
+model than an atomic sector, and the one that shows the meta checksum at
+work.
+*/
+POWER_SECTOR :: 512
+
+// A write a power loss tore: the byte ranges of it, [lo, hi) within its
+// bytes, that reached the disk. `op` is its index in the journal.
+Io_Tear :: struct {
+	op:   int,
+	keep: [][2]int,
+}
+
+// The operations up to and including the last sync among the first `n` of
+// `j`: what a power loss after them keeps whatever happens.
+journal_synced :: proc(j: Journal, n: int) -> int {
+	#reverse for r, i in j.ops[:n] {
+		if r.kind == .Sync {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+/*
+The image a power loss after the first `n` operations of `j` leaves: the
+baseline, every operation up to the last sync among them
+(journal_synced), then only the operations of `subset` (journal indexes in
+[journal_synced(j, n), n), ascending), each whole unless `tears` names it,
+in which case only the ranges it keeps. A truncate outside the subset
+leaves the size as it was; a write past the end extends the file with
+zeros, as ever.
+*/
+image_power :: proc(b: Baseline, j: Journal, n: int, subset: []int, tears: []Io_Tear, allocator := context.allocator) -> [dynamic]byte {
+	synced := journal_synced(j, n)
+	img := image_init(b, allocator)
+	for r in j.ops[:synced] {
+		image_apply(&img, r)
+	}
+	prev := synced - 1
+	for i in subset {
+		assert(prev < i && i < n, "a power-loss subset out of order or outside the unsynced operations")
+		prev = i
+		r := j.ops[i]
+		tear, torn := power_tear(tears, i)
+		if !torn {
+			image_apply(&img, r)
+			continue
+		}
+		assert(r.kind == .Write, "only a write can be torn")
+		for k in tear.keep {
+			part := r
+			part.offset = r.offset + i64(k[0])
+			part.bytes = r.bytes[k[0]:k[1]]
+			image_apply(&img, part)
+		}
+	}
+	return img
+}
+
+/*
+Writes to `path` the image a power loss after the first `n` operations of
+`j` leaves, keeping only `subset` of the unsynced ones and tearing
+`tears` (see image_power). Returns false on an I/O error.
+*/
+journal_image_power :: proc(b: Baseline, j: Journal, n: int, subset: []int, tears: []Io_Tear, path: string) -> bool {
+	img := image_power(b, j, n, subset, tears, context.temp_allocator)
+	return image_write(path, img[:])
+}
+
+@(private = "file")
+power_tear :: proc(tears: []Io_Tear, op: int) -> (tear: Io_Tear, ok: bool) {
+	for t in tears {
+		if t.op == op {
+			return t, true
+		}
+	}
+	return {}, false
+}
+
+// Whether the bytes of write `r` are all in the image.
+@(private = "file")
+image_has :: proc(img: []byte, r: Io_Record) -> bool {
+	end := int(r.offset) + len(r.bytes)
+	return end <= len(img) && slice.equal(img[r.offset:end], r.bytes)
+}
+
+// How many random subsets a power-loss sweep takes of each unsynced
+// window, after the fixed images.
+CRASH_SUBSETS :: #config(KV_CRASH_SUBSETS, 16)
+
+// The torn meta page of the fixed images: its header and the meta up to
+// and including the new txn_id, the rest (the tree, and the checksum) as
+// the slot held before. It claims the newer txn_id, and only the checksum
+// can tell.
+@(private = "file")
+POWER_META_TORN :: kv.META_OFFSET + int(offset_of(kv.Meta, txn_id)) + size_of(u64)
+
+/*
+Sweeps power losses over the run's journal. A power loss after the first
+n operations can leave any image a power loss just before the next sync
+can (the same synced prefix, and a subset of fewer unsynced operations is
+a subset of more), and must open at the same state, so the sweep cuts
+only there: before each sync, and at the end of the journal. Each cut's
+window is the operations since the previous sync. Per window, the fixed
+images: none of them, all of them, only the meta-page write, and all of
+them with the meta-page write torn (the last two when the window has one);
+then CRASH_SUBSETS random subsets with random tears, from the test's seed.
+
+An image may open at crash_synced_txn(run, n), or at its successor if and
+only if the successor's meta-page write is in the image whole: a meta page
+is either all there, or its checksum rejects it and the other slot is used.
+
+Then, beyond the power-loss model, one meta-corruption image per cut (see
+crash_image_meta_corrupt). Stops at the first image that fails.
+*/
+crash_sweep_power :: proc(t: ^testing.T, run: ^Crash_Run, path: string) -> (s: Crash_Sweep, ok: bool) {
+	ops := run.journal.ops[:]
+	for n in 0 ..= len(ops) {
+		if n < len(ops) && ops[n].kind != .Sync {
+			continue
+		}
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		s.cuts += 1
+		if !crash_image_meta_corrupt(t, run, path, n, &s) {
+			return s, false
+		}
+		first := journal_synced(run.journal, n)
+		if first == n {
+			// Nothing unsynced: the kill image at n, which the kill sweep checks.
+			continue
+		}
+		s.windows += 1
+		all := make([]int, n - first, context.temp_allocator)
+		meta := -1
+		for &i, k in all {
+			i = first + k
+			if _, is_meta := record_meta_txn_id(ops[i]); is_meta {
+				meta = i
+			}
+		}
+
+		// The fixed images.
+		if !crash_power_image(t, run, path, n, {}, {}, "none", &s) || !crash_power_image(t, run, path, n, all, {}, "all", &s) {
+			return s, false
+		}
+		if meta >= 0 {
+			torn := []Io_Tear{{meta, {{0, POWER_META_TORN}}}}
+			if len(all) > 1 && !crash_power_image(t, run, path, n, {meta}, {}, "only the meta page", &s) {
+				return s, false
+			}
+			if !crash_power_image(t, run, path, n, all, torn, "the meta page torn", &s) {
+				return s, false
+			}
+		}
+
+		// Random subsets, each from its own generator so it reproduces
+		// from the seed, the cut and its number alone.
+		for k in 0 ..< CRASH_SUBSETS {
+			state := rand.create(t.seed ~ u64(n) << 20 ~ u64(k))
+			gen := rand.default_random_generator(&state)
+			subset, tears := power_random(ops, all, gen)
+			if !crash_power_image(t, run, path, n, subset, tears, fmt.tprintf("random subset %d", k), &s) {
+				return s, false
+			}
+		}
+	}
+	return s, true
+}
+
+// A random subset of the window `all`: each operation kept with a
+// probability drawn per subset (sparse and dense subsets both), and each
+// write kept torn with probability 1/4, to a random half of its sectors,
+// or to a random prefix if it is shorter than a sector.
+@(private = "file")
+power_random :: proc(ops: []Io_Record, all: []int, gen: runtime.Random_Generator) -> (subset: []int, tears: []Io_Tear) {
+	keep := rand.float64(gen)
+	sub := make([dynamic]int, context.temp_allocator)
+	torn := make([dynamic]Io_Tear, context.temp_allocator)
+	for i in all {
+		if rand.float64(gen) >= keep {
+			continue
+		}
+		append(&sub, i)
+		r := ops[i]
+		if r.kind != .Write || rand.int_max(4, gen) != 0 {
+			continue
+		}
+		ranges := make([dynamic][2]int, context.temp_allocator)
+		if len(r.bytes) <= POWER_SECTOR {
+			if len(r.bytes) > 1 {
+				append(&ranges, [2]int{0, 1 + rand.int_max(len(r.bytes) - 1, gen)})
+			}
+		} else {
+			for lo := 0; lo < len(r.bytes); lo += POWER_SECTOR {
+				if rand.int_max(2, gen) == 0 {
+					continue
+				}
+				hi := min(lo + POWER_SECTOR, len(r.bytes))
+				if n := len(ranges); n > 0 && ranges[n - 1][1] == lo {
+					ranges[n - 1][1] = hi
+				} else {
+					append(&ranges, [2]int{lo, hi})
+				}
+			}
+		}
+		append(&torn, Io_Tear{i, ranges[:]})
+	}
+	return sub[:], torn[:]
+}
+
+// Builds and checks one power-loss image.
+@(private = "file")
+crash_power_image :: proc(t: ^testing.T, run: ^Crash_Run, path: string, n: int, subset: []int, tears: []Io_Tear, name: string, s: ^Crash_Sweep) -> bool {
+	img := image_power(run.base, run.journal, n, subset, tears, context.temp_allocator)
+	if !testing.expectf(t, image_write(path, img[:]), "%s: writing the image", run.name) {
+		return false
+	}
+	want := crash_synced_txn(run, n)
+	for i in subset {
+		if id, is_meta := record_meta_txn_id(run.journal.ops[i]); is_meta && image_has(img[:], run.journal.ops[i]) {
+			assert(kv.Txn_Id(id) == want + 1, "a meta page in the unsynced window that isn't the successor's")
+			want = kv.Txn_Id(id)
+		}
+	}
+	what := fmt.tprintf("power loss [seed %d] at cut %d of %d, %s: subset %s, tears %s",
+		t.seed, n, len(run.journal.ops), name, power_ranges(subset), power_tears(tears))
+	s.images += 1
+	s.committed += int(want != run.base_txn)
+	return crash_image_check(t, run, path, {want}, what)
+}
+
+// "3-7 9" for journal indexes 3, 4, 5, 6, 7 and 9.
+@(private = "file")
+power_ranges :: proc(ids: []int) -> string {
+	if len(ids) == 0 {
+		return "none"
+	}
+	b := strings.builder_make(context.temp_allocator)
+	for i := 0; i < len(ids); {
+		j := i
+		for j + 1 < len(ids) && ids[j + 1] == ids[j] + 1 {
+			j += 1
+		}
+		if i > 0 {
+			strings.write_byte(&b, ' ')
+		}
+		if j > i {
+			fmt.sbprintf(&b, "%d-%d", ids[i], ids[j])
+		} else {
+			fmt.sbprintf(&b, "%d", ids[i])
+		}
+		i = j + 1
+	}
+	return strings.to_string(b)
+}
+
+// "12 kept [0:512] [1024:4096]" per torn write.
+@(private = "file")
+power_tears :: proc(tears: []Io_Tear) -> string {
+	if len(tears) == 0 {
+		return "none"
+	}
+	b := strings.builder_make(context.temp_allocator)
+	for tear, i in tears {
+		fmt.sbprintf(&b, "%s%d kept", "; " if i > 0 else "", tear.op)
+		for k in tear.keep {
+			fmt.sbprintf(&b, " [%d:%d]", k[0], k[1])
+		}
+	}
+	return strings.to_string(b)
+}
+
+/*
+The meta-corruption image at cut n: the kill image after the first n
+operations with the meta page of the newest synced commit S made unreadable
+(its checksum flipped), where no later meta page was written. **Beyond the
+power-loss model**, which can't damage a synced meta page, and beyond the
+initiative's (it doesn't recover from corruption in general): the fallback
+to the other slot is the store's own design, and what it falls back to is
+S − 1, which the reuse horizon keeps intact however far the transaction
+after S got (KV-I-0002 D1). So the image must open at S − 1 and pass
+crash_image_check. Taken only where the run knows S − 1's state.
+*/
+@(private = "file")
+crash_image_meta_corrupt :: proc(t: ^testing.T, run: ^Crash_Run, path: string, n: int, s: ^Crash_Sweep) -> bool {
+	S := crash_synced_txn(run, n)
+	if crash_kill_txn(run, n) != S {
+		return true
+	}
+	if _, known := crash_state(run, S - 1); !known {
+		return true
+	}
+	img := image_init(run.base, context.temp_allocator)
+	for r in run.journal.ops[:n] {
+		image_apply(&img, r)
+	}
+	img[int(S & 1) * run.page_size + kv.META_OFFSET + int(offset_of(kv.Meta, checksum))] ~= 0xff
+	if !testing.expectf(t, image_write(path, img[:]), "%s: writing the image", run.name) {
+		return false
+	}
+	s.corrupt += 1
+	what := fmt.tprintf("meta corruption at cut %d of %d: the meta page of txn %d unreadable", n, len(run.journal.ops), S)
+	return crash_image_check(t, run, path, {S - 1}, what)
 }

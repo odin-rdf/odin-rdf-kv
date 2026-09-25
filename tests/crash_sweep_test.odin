@@ -9,11 +9,13 @@ import "core:time"
 import kv "../kv"
 
 /*
-The kill-image crash sweep (KV-I-0005 D1, D8, KV-T-0027): workloads 1–4 of
-the initiative's design, each swept cut by cut with crash_sweep_kill (see
-crash.odin). Only registered in a build with `-define:KV_IO_HOOK=true`;
-scripts/test.sh runs one, with KV_NO_SYNC. `-define:KV_CRASH=true` selects
-larger trees.
+The crash sweeps (KV-I-0005 D1, D2, D8, KV-T-0027, KV-T-0028): workloads
+1–4 of the initiative's design, each swept cut by cut with process kills
+(crash_sweep_kill) and power losses (crash_sweep_power, see crash.odin).
+Only registered in a build with `-define:KV_IO_HOOK=true`; scripts/test.sh
+runs one, with KV_NO_SYNC. `-define:KV_CRASH=true` selects larger trees,
+and `-define:KV_CRASH_SUBSETS=n` the random power-loss subsets per window
+(default 16).
 
 Each workload asserts that it did what it is named for, so a change that
 stops a commit spilling, say, fails here rather than quietly sweeping less.
@@ -41,6 +43,26 @@ when kv.IO_HOOK {
 	test_crash_kill_reuse :: proc(t: ^testing.T) {
 		crash_kill(t, crash_workload_reuse)
 	}
+
+	@(test)
+	test_crash_power_puts :: proc(t: ^testing.T) {
+		crash_power(t, crash_workload_puts)
+	}
+
+	@(test)
+	test_crash_power_spill :: proc(t: ^testing.T) {
+		crash_power(t, crash_workload_spill)
+	}
+
+	@(test)
+	test_crash_power_deletes :: proc(t: ^testing.T) {
+		crash_power(t, crash_workload_deletes)
+	}
+
+	@(test)
+	test_crash_power_reuse :: proc(t: ^testing.T) {
+		crash_power(t, crash_workload_reuse)
+	}
 }
 
 // Larger trees for the sweep, on demand.
@@ -53,21 +75,37 @@ Crash_Workload :: #type proc(t: ^testing.T, path: string, run: ^Crash_Run) -> bo
 
 // Runs `workload` and sweeps process kills over its journal.
 crash_kill :: proc(t: ^testing.T, workload: Crash_Workload) -> (s: Crash_Sweep, ok: bool) {
+	run: Crash_Run
+	defer crash_run_destroy(&run)
+	start := time.tick_now()
+	s, ok = crash_sweep(t, workload, &run, crash_sweep_kill)
+	log.infof("%s: %d cuts over %d commits (%d after a truncate, %d at a workload commit) in %v",
+		run.name, s.cuts, len(run.commits), s.after_truncate, s.committed, time.tick_since(start))
+	return s, ok
+}
+
+// Runs `workload` and sweeps power losses over its journal.
+crash_power :: proc(t: ^testing.T, workload: Crash_Workload) -> (s: Crash_Sweep, ok: bool) {
+	run: Crash_Run
+	defer crash_run_destroy(&run)
+	start := time.tick_now()
+	s, ok = crash_sweep(t, workload, &run, crash_sweep_power)
+	log.infof("%s: power loss at %d cuts over %d commits, %d with unsynced writes: %d images (%d at a workload commit), %d meta-corruption images, in %v",
+		run.name, s.cuts, len(run.commits), s.windows, s.images, s.committed, s.corrupt, time.tick_since(start))
+	return s, ok
+}
+
+// Runs `workload` into `run` in a temporary directory, then `sweep`.
+@(private = "file")
+crash_sweep :: proc(t: ^testing.T, workload: Crash_Workload, run: ^Crash_Run, sweep: proc(t: ^testing.T, run: ^Crash_Run, path: string) -> (Crash_Sweep, bool)) -> (s: Crash_Sweep, ok: bool) {
 	dir := temp_dir_create(t)
 	defer temp_dir_destroy(&dir, "db", "image")
 	path := strings.clone(temp_dir_file(dir, "db"), context.temp_allocator)
 	image := strings.clone(temp_dir_file(dir, "image"), context.temp_allocator)
-
-	run: Crash_Run
-	defer crash_run_destroy(&run)
-	start := time.tick_now()
-	if !workload(t, path, &run) {
+	if !workload(t, path, run) {
 		return s, false
 	}
-	s, ok = crash_sweep_kill(t, &run, image)
-	log.infof("%s: %d cuts over %d commits (%d after a truncate, %d at a workload commit) in %v",
-		run.name, s.cuts, len(run.commits), s.after_truncate, s.committed, time.tick_since(start))
-	return s, ok
+	return sweep(t, run, image)
 }
 
 // A key space of 8-byte big-endian keys 0 ..< n, for workloads that need to
@@ -141,6 +179,7 @@ crash_workload_puts :: proc(t: ^testing.T, path: string, run: ^Crash_Run) -> boo
 	crash_run_init(run, "puts", key_space_make(n))
 	env := crash_open(t, path) or_return
 
+	crash_pre_baseline(run)
 	txn, _ := kv.txn_begin(env, read_only = false)
 	for id in 0 ..< n {
 		if id % 8 != 0 && crash_put(&txn, run, id, 50 + id * 37 % 250) != .None {
@@ -201,6 +240,7 @@ crash_workload_spill :: proc(t: ^testing.T, path: string, run: ^Crash_Run) -> bo
 	crash_put(&txn, run, big, big_pages * ps)
 	ok := commit_ok(t, env, &txn)
 	if ok {
+		crash_pre_baseline(run)
 		txn, _ = kv.txn_begin(env, read_only = false)
 		crash_del(&txn, run, big)
 		ok = commit_ok(t, env, &txn)
@@ -254,6 +294,7 @@ crash_workload_deletes :: proc(t: ^testing.T, path: string, run: ^Crash_Run) -> 
 	crash_run_init(run, "deletes", crash_u64_keys(n))
 	env := crash_open(t, path) or_return
 
+	crash_pre_baseline(run)
 	txn, _ := kv.txn_begin(env, read_only = false)
 	for id in 0 ..< n {
 		crash_put(&txn, run, id, SHAPE_VAL)
@@ -303,6 +344,9 @@ crash_workload_reuse :: proc(t: ^testing.T, path: string, run: ^Crash_Run) -> bo
 
 	ok := true
 	for round in 0 ..< 3 {
+		if round == 2 {
+			crash_pre_baseline(run)
+		}
 		txn, _ := kv.txn_begin(env, read_only = false)
 		for id in 0 ..< n {
 			if (round == 0 && id % 11 != 0) || (round > 0 && id % 3 == round) {
