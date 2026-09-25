@@ -33,5 +33,7 @@ for target in darwin_arm64 darwin_amd64 linux_arm64 linux_amd64; do
 	odin check kv -no-entry-point -vet -strict-style -target:"$target"
 	odin check tests -no-entry-point -vet -strict-style -target:"$target"
 	odin check tests -no-entry-point -vet -strict-style -target:"$target" -define:KV_IO_HOOK=true -define:KV_NO_SYNC=true
+	# The real-kill test's helper (KV-T-0032), which only that test builds.
+	odin check tests/killer -vet -strict-style -target:"$target"
 done
 echo "== all configurations passed"
