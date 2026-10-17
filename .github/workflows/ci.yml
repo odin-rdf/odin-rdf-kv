@@ -50,13 +50,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Pinned to the release scripts/linux.Dockerfile builds with and the
-      # development machine runs, so CI, the Linux container and a local run
-      # compile with the same compiler. Bump all three together.
+      # The newest Odin release, not a pinned one, as in every library of the
+      # family: an Odin release can still break source, and a library's
+      # own CI is where that should show first, before a consumer building
+      # with the new compiler finds it. The next step prints which release
+      # ran. scripts/linux.Dockerfile is pinned instead (its download URL
+      # needs a version) and follows the development machine, not this.
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release: dev-2026-09
+          release: latest
 
       - name: Odin version
         run: odin version

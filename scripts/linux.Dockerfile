@@ -2,7 +2,7 @@
 # linker) and a pinned Odin release. Keep ODIN_VERSION in step with the
 # compiler used on the development machine (`odin version`).
 FROM ubuntu:24.04
-ARG ODIN_VERSION=dev-2026-09
+ARG ODIN_VERSION=dev-2026-10
 ARG ODIN_ARCH=arm64
 RUN apt-get update \
  && apt-get install -y --no-install-recommends clang curl ca-certificates \

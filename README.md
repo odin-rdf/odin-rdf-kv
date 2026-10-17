@@ -18,7 +18,7 @@ All seven steps of the original design are built and tested: the file format, re
 - **No release is tagged yet.** CI runs the suite on Linux (`ubuntu-latest`) on every push to `main` and every pull request; macOS is tested locally.
 - **The file format is version 1**, and there is no migration path to any later version.
 - **Platforms:** macOS (development) and Linux (production), 64-bit only. There is no Windows support.
-- **Toolchain:** Odin `dev-2026-09`.
+- **Toolchain:** Odin `dev-2026-10`.
 
 ## Adding it to a project
 
