@@ -110,8 +110,10 @@ DEFAULT_CHUNK_SIZE :: 256 * 1024
 /*
 The smallest chunk size. Linux maps 64 KiB, aligned, per fault of a file
 mapping (fault-around, measured in KV-T-0019), so a smaller chunk would see
-pages become resident that no read of it caused. It is also at least every
-valid page size, so a page never spans two chunks, and at least the OS page
+pages become resident that no read of it caused. Newer kernels map the
+whole page-cache folio a faulting page is in, which is why the store's
+writes are cut at this size (WRITE_PIECE). It is also at least every valid
+page size, so a page never spans two chunks, and at least the OS page
 size on every supported platform.
 */
 MIN_CHUNK_SIZE :: 64 * 1024

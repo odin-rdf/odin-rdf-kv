@@ -158,7 +158,27 @@ os_pread :: proc(fd: posix.FD, buf: []byte, offset: i64) -> Error {
 	return .None
 }
 
-// Writes all of `buf` at `offset`.
+/*
+The most a single pwrite writes, aligned in the file: MIN_CHUNK_SIZE, so
+that no page-cache folio the store creates spans two chunks of any valid
+chunk size (KV-I-0004 D7). A buffered write is what sizes the folios:
+Linux caches a write in naturally aligned folios as large as the write
+allows, up to 2 MiB (ext4 and xfs, measured on 7.2), and on 7.0 and 7.2
+(not 6.17) a fault on any page of a folio maps the whole folio into the process,
+past the 64 KiB fault-around window and past the chunk the read was
+counted in, so the resident estimate missed chunks the process held. Cut
+at 64 KiB, every folio a write creates lies inside one chunk, whatever
+chunk size this or a later open uses, since the page cache outlives an
+open. Folios made by others' reads of the file (readahead) aren't covered.
+*/
+@(private)
+WRITE_PIECE :: MIN_CHUNK_SIZE
+
+/*
+Writes all of `buf` at `offset`, in pwrite calls none of which crosses a
+multiple of WRITE_PIECE in the file. io_hook sees the whole write as one
+operation.
+*/
 os_pwrite :: proc(fd: posix.FD, buf: []byte, offset: i64) -> Error {
 	when IO_HOOK {
 		if io_hook != nil {
@@ -167,7 +187,8 @@ os_pwrite :: proc(fd: posix.FD, buf: []byte, offset: i64) -> Error {
 	}
 	buf, offset := buf, offset
 	for len(buf) > 0 {
-		n := posix.pwrite(fd, raw_data(buf), c.size_t(len(buf)), posix.off_t(offset))
+		size := min(len(buf), WRITE_PIECE - int(offset & (WRITE_PIECE - 1)))
+		n := posix.pwrite(fd, raw_data(buf), c.size_t(size), posix.off_t(offset))
 		if n < 0 {
 			if posix.errno() == .EINTR {
 				continue
@@ -186,7 +207,9 @@ os_pwrite :: proc(fd: posix.FD, buf: []byte, offset: i64) -> Error {
 // only pages inside the file may be touched. The alignment keeps each chunk
 // of the map (KV-I-0004 D7) aligned in the address space, which Linux's
 // fault-around window (64 KiB, aligned by address; KV-T-0019) needs to
-// stay inside one chunk: mmap alone only aligns to the OS page.
+// stay inside one chunk: mmap alone only aligns to the OS page. A folio
+// mapped whole (see WRITE_PIECE) is aligned by file offset, and offset 0
+// is at the map's base, so it stays inside a chunk too.
 os_map_reserve :: proc(fd: posix.FD, map_size, align: int) -> (base: [^]byte, err: Error) {
 	// Reserve enough to find an aligned start, map the file over it there,
 	// and give back the slack on either side.
