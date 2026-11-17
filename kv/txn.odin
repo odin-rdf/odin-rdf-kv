@@ -133,6 +133,10 @@ txn_begin :: proc(env: ^Env, read_only := true) -> (txn: Txn, err: Error) {
 	// A reader registers its snapshot under the same lock that copies it, so
 	// a writer computing the oldest reader can't miss it: the snapshot is
 	// either still the latest one or already in the table.
+	// A write transaction also copies the snapshots readers hold: a
+	// free-list run is kept for readers of its own snapshot (see
+	// freelist_release). The table has one slot per snapshot.
+	held: []Txn_Id
 	sync.mutex_lock(&env.snapshot_mutex)
 	txn.snapshot = env.snapshot
 	if read_only {
@@ -142,6 +146,18 @@ txn_begin :: proc(env: ^Env, read_only := true) -> (txn: Txn, err: Error) {
 		}
 	} else {
 		txn.write.oldest = reuse_horizon(env, txn.snapshot.txn_id)
+		h, h_err := make([]Txn_Id, len(env.readers), virtual.arena_allocator(&txn.write.arena))
+		if h_err != nil {
+			sync.mutex_unlock(&env.snapshot_mutex)
+			virtual.arena_destroy(&txn.write.arena)
+			free(txn.write, env.allocator)
+			sync.mutex_unlock(&env.writer_mutex)
+			return {}, .Out_Of_Memory
+		}
+		for slot, i in env.readers {
+			h[i] = slot.txn_id
+		}
+		held = h
 	}
 	sync.mutex_unlock(&env.snapshot_mutex)
 
@@ -151,7 +167,7 @@ txn_begin :: proc(env: ^Env, read_only := true) -> (txn: Txn, err: Error) {
 		// done in place rather than at commit.
 		w := txn.write
 		n_ready := len(env.free.ready)
-		if rel_err := freelist_release(&env.free, w.oldest, virtual.arena_allocator(&w.arena)); rel_err != .None {
+		if rel_err := freelist_release(&env.free, txn.snapshot.txn_id, w.oldest, held, virtual.arena_allocator(&w.arena)); rel_err != .None {
 			virtual.arena_destroy(&w.arena)
 			free(w, env.allocator)
 			sync.mutex_unlock(&env.writer_mutex)

@@ -102,7 +102,7 @@ At open, the store reserves `Options.map_size` bytes of address space (1 GiB by 
 - **Ending:** every transaction ends with `txn_abort`, which is also what `txn_commit` does once it has made the commit durable. Calling `txn_abort` more than once, or after `txn_commit`, is safe, so `defer kv.txn_abort(&txn)` right after `txn_begin` is the pattern.
 - **A `Txn` is a value.** Begin it into a variable and pass that same variable by pointer. Use a transaction from one thread at a time.
 
-A reader that stays open pins the snapshot it began on: pages freed after it cannot be reused until it ends, and the file grows to make room instead. Keep read transactions short, as you would with LMDB.
+A reader that stays open pins the snapshot it began on: the pages that later commits free from the tree cannot be reused until it ends, so the file grows by those pages, and only those, for as long as it stays open. Growth is linear in what the commits change: a reader held across 3,000 commits that each rewrite one small value grows the file by about 6,100 pages (25 MB at 4 KiB pages), and the free list's own bookkeeping does not compound. Once the reader ends, the next write transaction can reuse every page it pinned, but the file never shrinks. A reader held for an online backup is fine; one held for hours on a busy store costs its writes' worth of disk. Keep other read transactions short, as you would with LMDB.
 
 ### Keys, values and slice lifetimes
 

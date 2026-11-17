@@ -1,6 +1,7 @@
 package kv_tests
 
 import "core:fmt"
+import "core:slice"
 import "core:strings"
 import "core:sys/posix"
 import "core:testing"
@@ -56,6 +57,17 @@ dirty_buf :: proc(txn: ^kv.Txn, pgno: kv.Pgno) -> (buf: []byte, ok: bool) {
 	ps := txn.env.page_size
 	off := int(d.slot) * ps
 	return txn.env.pool.base[off:off + int(d.pages) * ps], true
+}
+
+// Every record of Env.free that isn't reusable yet, the earlier free-list
+// runs' included, in the order a run lists them: by (txn_id, pgno) (temp
+// allocator).
+free_waiting :: proc(env: ^kv.Env) -> []kv.Free_Record {
+	records := slice.concatenate([][]kv.Free_Record{env.free.pending[:], env.free.runs[:]}, context.temp_allocator)
+	slice.sort_by(records, proc(a, b: kv.Free_Record) -> bool {
+		return a.txn_id < b.txn_id || (a.txn_id == b.txn_id && a.pgno < b.pgno)
+	})
+	return records
 }
 
 // The page numbers a write transaction has written so far, one per dirty or

@@ -48,8 +48,9 @@ expect_free :: proc(t: ^testing.T, env: ^kv.Env, want: Expected_Free, on_disk :=
 	slice.sort(want.ready[:])
 	ok := slice.equal(env.free.ready[:], want.ready[:])
 	testing.expectf(t, ok, "ready pages differ: %d, want %d", len(env.free.ready), len(want.ready), loc = loc)
-	pending_ok := slice.equal(env.free.pending[:], want.pending[:])
-	testing.expectf(t, pending_ok, "pending records differ: %d, want %d", len(env.free.pending), len(want.pending), loc = loc)
+	waiting := free_waiting(env)
+	pending_ok := slice.equal(waiting, want.pending[:])
+	testing.expectf(t, pending_ok, "pending records differ: %d, want %d", len(waiting), len(want.pending), loc = loc)
 
 	if !on_disk {
 		return ok && pending_ok
@@ -828,7 +829,7 @@ test_freelist_run_length_fits_its_records :: proc(t: ^testing.T) {
 			testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
 			for i in 0 ..< c.pages {
 				p := u64le(snap.freelist_pgno + kv.Pgno(i))
-				testing.expectf(t, slice.contains(env.free.pending[:], kv.Free_Record{pgno = p, txn_id = u64le(snap.txn_id + 1)}), "stride %d: run page %d was not freed", c.stride, p)
+				testing.expectf(t, slice.contains(env.free.runs[:], kv.Free_Record{pgno = p, txn_id = u64le(snap.txn_id + 1)}), "stride %d: run page %d was not freed", c.stride, p)
 			}
 		}
 		if env != nil {
@@ -863,7 +864,9 @@ test_freelist_longer_than_pool :: proc(t: ^testing.T) {
 		testing.expectf(t, pages > kv.MIN_DIRTY_PAGES, "stride %d: a run of only %d pages", stride, pages)
 		testing.expectf(t, (snap.freelist_pgno <= last) == (stride == 1), "stride %d: run at %d, last_pgno was %d", stride, snap.freelist_pgno, last)
 		disk := read_freelist(t, env, snap)
-		ok := len(disk) == len(env.free.ready) + len(env.free.pending)
+		waiting := free_waiting(env)
+		testing.expectf(t, len(env.free.runs) > 0, "stride %d: the previous run was not freed", stride)
+		ok := len(disk) == len(env.free.ready) + len(waiting)
 		for r, i in disk {
 			if !ok {
 				break
@@ -871,7 +874,7 @@ test_freelist_longer_than_pool :: proc(t: ^testing.T) {
 			if i < len(env.free.ready) {
 				ok = r == kv.Free_Record{pgno = u64le(env.free.ready[i])}
 			} else {
-				ok = r == env.free.pending[i - len(env.free.ready)]
+				ok = r == waiting[i - len(env.free.ready)]
 			}
 		}
 		testing.expectf(t, ok, "stride %d: the run on disk differs from the free list", stride)

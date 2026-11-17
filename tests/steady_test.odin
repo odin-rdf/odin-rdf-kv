@@ -184,8 +184,8 @@ test_env_stats :: proc(t: ^testing.T) {
 		testing.expect_value(t, s.last_pgno, kv.env_snapshot(env).last_pgno, loc = loc)
 		testing.expect_value(t, s.file_pages, int(size) / env.page_size, loc = loc)
 		testing.expect_value(t, s.free_ready, len(env.free.ready), loc = loc)
-		testing.expect_value(t, s.free_pending, len(env.free.pending), loc = loc)
-		testing.expect_value(t, s.free_list_bytes, cap(env.free.ready) * size_of(kv.Pgno) + cap(env.free.pending) * size_of(kv.Free_Record), loc = loc)
+		testing.expect_value(t, s.free_pending, len(env.free.pending) + len(env.free.runs), loc = loc)
+		testing.expect_value(t, s.free_list_bytes, cap(env.free.ready) * size_of(kv.Pgno) + (cap(env.free.pending) + cap(env.free.runs)) * size_of(kv.Free_Record), loc = loc)
 		testing.expect_value(t, s.readers, readers, loc = loc)
 		testing.expect_value(t, s.oldest_reader, oldest, loc = loc)
 		return s

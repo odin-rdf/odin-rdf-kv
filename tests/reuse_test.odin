@@ -1,6 +1,7 @@
 package kv_tests
 
 import "core:fmt"
+import "core:log"
 import "core:math/rand"
 import "core:slice"
 import "core:sync"
@@ -171,7 +172,7 @@ test_reuse_waits_for_reader :: proc(t: ^testing.T) {
 		}
 		testing.expect(t, !any_in(f, written), "a page freed by 3 was reused while snapshot 2 is read")
 		for p in f {
-			testing.expectf(t, slice.contains(env.free.pending[:], kv.Free_Record{pgno = u64le(p), txn_id = 3}), "page %d is not pending with tag 3", p)
+			testing.expectf(t, slice.contains(free_waiting(env), kv.Free_Record{pgno = u64le(p), txn_id = 3}), "page %d is not pending with tag 3", p)
 		}
 	}
 	// Snapshot 2 is intact, its free-list run included.
@@ -371,12 +372,12 @@ test_reuse_abort_leaves_free_unchanged :: proc(t: ^testing.T) {
 		txn, _ := kv.txn_begin(env, read_only = false)
 		if attempt == 0 {
 			ready = slice.clone(env.free.ready[:], context.temp_allocator)
-			pending = slice.clone(env.free.pending[:], context.temp_allocator)
+			pending = free_waiting(env)
 			testing.expect(t, len(ready) > 0, "nothing reusable")
 		} else {
 			// Beginning again from the same snapshot has nothing to move.
 			testing.expect(t, slice.equal(env.free.ready[:], ready), "ready pages changed by beginning again")
-			testing.expect(t, slice.equal(env.free.pending[:], pending), "pending records changed by beginning again")
+			testing.expect(t, slice.equal(free_waiting(env), pending), "pending records changed by beginning again")
 		}
 		for i in 0 ..< 2_000 {
 			key: [8]byte
@@ -391,7 +392,7 @@ test_reuse_abort_leaves_free_unchanged :: proc(t: ^testing.T) {
 		kv.txn_abort(&txn)
 
 		testing.expectf(t, slice.equal(env.free.ready[:], ready), "attempt %d: ready pages changed", attempt)
-		testing.expectf(t, slice.equal(env.free.pending[:], pending), "attempt %d: pending records changed", attempt)
+		testing.expectf(t, slice.equal(free_waiting(env), pending), "attempt %d: pending records changed", attempt)
 		testing.expect_value(t, kv.env_snapshot(env), before)
 		expect_latest_ok(t, env)
 	}
@@ -554,7 +555,7 @@ test_reuse_full_map :: proc(t: ^testing.T) {
 	// to go.
 	txn, _ := kv.txn_begin(env, read_only = false)
 	ready := slice.clone(env.free.ready[:], context.temp_allocator)
-	pending := slice.clone(env.free.pending[:], context.temp_allocator)
+	pending := free_waiting(env)
 	key: [8]byte
 	testing.expect_value(t, kv.put(&txn, u64_key(&key, 0), value(0, 999)), kv.Error.None)
 	for {
@@ -567,7 +568,7 @@ test_reuse_full_map :: proc(t: ^testing.T) {
 	testing.expect_value(t, kv.txn_commit(&txn), kv.Error.Map_Full)
 	testing.expect_value(t, kv.env_snapshot(env), before)
 	testing.expect(t, slice.equal(env.free.ready[:], ready), "ready pages changed")
-	testing.expect(t, slice.equal(env.free.pending[:], pending), "pending records changed")
+	testing.expect(t, slice.equal(free_waiting(env), pending), "pending records changed")
 	testing.expect(t, sync.mutex_try_lock(&env.writer_mutex), "writer lock not released")
 	sync.mutex_unlock(&env.writer_mutex)
 	kv.env_close(env)
@@ -588,4 +589,152 @@ test_reuse_full_map :: proc(t: ^testing.T) {
 	}
 	expect_tree_ok(t, &reader)
 	expect_space_ok(t, &reader)
+}
+
+// Commits the long-reader test makes while its reader is held: a few
+// thousand without syncs, and with real syncs (about 8 ms a commit on
+// macOS) 500, enough for the free list's compounding, were it back, to
+// break the bound by hundreds of pages (it does at 100).
+LONG_READER_COMMITS :: #config(KV_LONG_READER_COMMITS, 3_000 when kv.NO_SYNC else 500)
+
+/*
+A reader held across many small commits pins the pages they free, and the
+file grows by those pages, linearly: the free list's own runs don't
+compound. Each commit writes the whole list to a new run and frees the
+previous one; were the runs pinned too, every commit would add a run's worth
+of pages (a 256th of the list) to the pending ones, and the list and the
+file would grow by that fraction per commit, doubling about every 180
+commits. Only the run of the snapshot the reader holds is kept, so its
+space_check still passes at the end.
+
+Then the reader ends, and the pages it pinned are reused: further commits
+don't grow the file.
+*/
+@(test)
+test_reuse_long_reader_grows_linearly :: proc(t: ^testing.T) {
+	dir := temp_dir_create(t)
+	defer temp_dir_destroy(&dir, DB)
+
+	env, err := kv.env_open(temp_dir_file(dir, DB))
+	testing.expect_value(t, err, kv.Error.None)
+	if err != .None {
+		return
+	}
+	defer kv.env_close(env)
+
+	KEYS :: 200
+	value :: proc(i, round: int) -> []byte {
+		return transmute([]byte)fmt.tprintf("value %06d of key %06d, padded to about 48 bytes", round, i)
+	}
+	// Overwrites key `i` with round `round`'s value. Returns the pages the
+	// transaction freed.
+	overwrite :: proc(t: ^testing.T, env: ^kv.Env, i, round: int, written: ^[dynamic]kv.Pgno = nil) -> (freed: int, ok: bool) {
+		txn, err := kv.txn_begin(env, read_only = false)
+		if !testing.expect_value(t, err, kv.Error.None) {
+			return
+		}
+		defer kv.txn_abort(&txn)
+		key: [8]byte
+		if !testing.expect_value(t, kv.put(&txn, u64_key(&key, u64(i)), value(i, round)), kv.Error.None) {
+			return
+		}
+		freed = len(txn.write.freed)
+		if written != nil {
+			append(written, ..written_pgnos(&txn))
+		}
+		return freed, testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None)
+	}
+
+	{
+		txn, _ := kv.txn_begin(env, read_only = false)
+		for i in 0 ..< KEYS {
+			key: [8]byte
+			kv.put(&txn, u64_key(&key, u64(i)), value(i, 0))
+		}
+		if !testing.expect_value(t, kv.txn_commit(&txn), kv.Error.None) {
+			return
+		}
+	}
+	// A few commits with no reader, so the list holds some of everything.
+	round := 1
+	for ; round <= 10; round += 1 {
+		if _, ok := overwrite(t, env, round % KEYS, round); !ok {
+			return
+		}
+	}
+
+	reader, _ := kv.txn_begin(env)
+	defer kv.txn_abort(&reader)
+	start := kv.env_stats(env)
+	freed := 0
+	held_ok := true
+	for c in 1 ..= LONG_READER_COMMITS {
+		f, ok := overwrite(t, env, round % KEYS, round)
+		if !ok {
+			return
+		}
+		round += 1
+		freed += f
+		if c % 100 != 0 && c != LONG_READER_COMMITS {
+			continue
+		}
+		// What the commits freed is pinned. Beyond it the file holds a few
+		// runs' worth of pages (each run as long as the list needs, or a
+		// page more): the reader's own run, the two in flight, and pieces
+		// of runs the list has outgrown, too short for the next one, until
+		// single pages use them up. Measured: about 5 runs, so the slack
+		// is 8. A run lists every pinned page, so this too grows linearly,
+		// at about a fiftieth of a page per freed page; a list that
+		// compounds passes the bound by 100 commits.
+		s := kv.env_stats(env)
+		run := freelist_run_len(t, env, kv.env_snapshot(env))
+		growth := int(s.last_pgno - start.last_pgno)
+		bound := freed + 8 * (run + 1) + 16
+		if c % 500 == 0 || c == LONG_READER_COMMITS {
+			log.infof("[seed %d] %d commits with a reader held: %d pages freed, last_pgno %d (+%d, bound %d), %d pending, %d ready, a run of %d pages, %d file pages", t.seed, c, freed, s.last_pgno, growth, bound, s.free_pending, s.free_ready, run, s.file_pages)
+		}
+		held_ok = testing.expectf(t, growth <= bound, "after %d commits the file grew by %d pages, but the commits freed %d (a run of %d pages)", c, growth, freed, run)
+		held_ok &= testing.expectf(t, s.free_pending <= freed + 3 * (run + 1) + 16, "after %d commits %d pages are pending, but the commits freed %d (a run of %d pages)", c, s.free_pending, freed, run)
+		if !held_ok {
+			// Stop before a compounding list fills the disk.
+			break
+		}
+	}
+	testing.expect_value(t, kv.env_stats(env).oldest_reader, reader.snapshot.txn_id)
+	// The reader's snapshot is intact, its free-list run included.
+	for i in 0 ..< KEYS {
+		key: [8]byte
+		got, get_err := kv.get(&reader, u64_key(&key, u64(i)))
+		if get_err != .None || len(got) != len(value(i, 0)) {
+			testing.expectf(t, false, "key %d: got %q, %v", i, string(got), get_err)
+			break
+		}
+	}
+	expect_space_ok(t, &reader)
+	kv.txn_abort(&reader)
+	if !held_ok {
+		return
+	}
+
+	// With the reader gone, the pages it pinned are reused.
+	held := kv.env_stats(env)
+	written := make([dynamic]kv.Pgno, context.temp_allocator)
+	reused := 0
+	for _ in 0 ..< 300 {
+		clear(&written)
+		if _, ok := overwrite(t, env, round % KEYS, round, &written); !ok {
+			return
+		}
+		round += 1
+		for p in written {
+			if p <= held.last_pgno {
+				reused += 1
+			}
+		}
+	}
+	after := kv.env_stats(env)
+	testing.expectf(t, after.last_pgno == held.last_pgno, "the file grew from %d to %d pages after the reader ended", held.last_pgno, after.last_pgno)
+	testing.expectf(t, reused >= 300, "only %d pages reused after the reader ended", reused)
+	testing.expectf(t, after.free_pending < held.free_pending / 10, "%d pages still pending after the reader ended, %d while it was held", after.free_pending, held.free_pending)
+	expect_latest_ok(t, env)
 }

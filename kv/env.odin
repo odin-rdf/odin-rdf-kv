@@ -372,8 +372,8 @@ stats_update_free :: proc(env: ^Env) {
 @(private)
 stats_set_free :: proc(env: ^Env) {
 	env.stats.free_ready = len(env.free.ready)
-	env.stats.free_pending = len(env.free.pending)
-	env.stats.free_list_bytes = cap(env.free.ready) * size_of(Pgno) + cap(env.free.pending) * size_of(Free_Record)
+	env.stats.free_pending = len(env.free.pending) + len(env.free.runs)
+	env.stats.free_list_bytes = cap(env.free.ready) * size_of(Pgno) + (cap(env.free.pending) + cap(env.free.runs)) * size_of(Free_Record)
 }
 
 // Returns the oldest snapshot held by a live read transaction, or false if
